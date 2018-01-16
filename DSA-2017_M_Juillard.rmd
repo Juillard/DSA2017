@@ -22,7 +22,8 @@ vignette: >
   %\VignetteEncoding{UTF-8}
 ---
 
-```{r Définition des fonctions_1, include=FALSE}
+```{r Définition des fonctions_1, include=FALSE}$
+# Hello Git
 # Fonction permettant de charger les packages dans le cas ou ils ne sont pas present sur le poste qui lance le progamme
 install.load.packages <- function(...){
   liste=unlist(list(...))
