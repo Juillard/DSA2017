@@ -1,0 +1,1908 @@
+---
+title: "Air BnB"
+author: "Marc Juillard"
+date: '2017'
+output:
+  html_document:
+    self_contained: no
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: yes
+      mooth_scroll: no
+  html_notebook:
+    fig_caption: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+vignette: >
+  %\VignetteIndexEntry{Air Bnb}
+  %\VignetteEngine{knitr::rmarkdown} 
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r Définition des fonctions_1, include=FALSE}$
+# Hello Git
+# Fonction permettant de charger les packages dans le cas ou ils ne sont pas present sur le poste qui lance le progamme
+install.load.packages <- function(...){
+  liste=unlist(list(...))
+  new.pkg <- liste[!(liste %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)>0){
+    install.packages(new.pkg, dependencies = TRUE)
+  }
+  sapply(liste, require, character.only = TRUE)
+}
+
+
+# Code utilisé pour calculer la distance entre un  bien (lat,lon) et le bien plus proche d'une liste (table_lat,table_long)
+# Ce code sera utilisé pour calculer le métro et/ou restaurant le plus proche.
+# La distance est calculée par la formule geosphere (qui permet de prendre en compte la courbure de la terre pour une distance)
+dist=function(long,lat,table_long,table_lat){
+  temp=data.frame('lat'=table_lat,'lon'=table_long,'dist'=rep(0,length(table_lat)))
+  temp$dist=apply(temp,1,function(x){geosphere::distHaversine(c(long,lat),c(x[2],x[1]),r=6371000)})
+  return(min(temp$dist))
+}
+
+# Code permettant de définir dans quelle grille se trouve un point (lat,lon). 
+# Taille indique le nombre de case en largeur dans la grille (ou longueur comme c est un carre)
+# Le calcul se fait simplement par modulo
+Position_Grille = function(lat,long,Taille){
+  pas_lat = (max(Grille_lat$lat) - min(Grille_lat$lat))/Taille # nombre de latitude par case
+  pas_long = (max(Grille_long$long) - min(Grille_long$long))/Taille # nombre de longitude par case
+  i = (lat - min(Grille_lat$lat)) %/% pas_lat
+  j = (long - min(Grille_long$long)) %/% pas_long
+  return(i*Taille + j + 1)
+}
+
+# Code permettant de calculer les métros qui sont dans les 9 cases entourant un point (le fait de rentenir 9 cases permet de solutionner les problemes de bords:
+
+# |----|----|---|
+# |    |   -|   | 
+# |----|----|---|
+# |    | X  |   |
+# |----|----|---|
+# |    |    |   |
+# |----|----|---|
+
+Metro_Grille=function(Metro,Grille,i){
+  N=Grille[i]
+  liste=c(N-1,N,N+1)
+  j=max(N-30,1) # Permet de gérer la ligne du dessous (Taille de la grille = 30)
+  liste=c(liste,j-1,j,j+1)
+  j=min(N+30,899) # Permet de gérer la ligne du dessus (la taille 30*30 est ici inscrite en dur)
+  liste=c(liste,j-1,j,j+1)
+  liste=unique(liste) # Dans le cas ou l'on était en bord de carte, on a concaténé des lignes identiques.
+  return(Metro %in% liste)
+}
+
+# Code pour scraper openstreetmap : récupère la latitude et la longitude de monuments parisiens qui ont prédécemment été récupéré sur le site 'http://monumentsdeparis.net/'
+Scrap_Map=function(lieu){
+  # Construction de l'URL de recherche
+  URL <- paste("http://nominatim.openstreetmap.org/search?q=Paris+",lieu,"&polygon_geojson=1&viewbox=",sep="")
+  # Lecture du code HTML de la page
+  url.get=xml2::read_html(URL)
+  # Cette première page ne nous interesse pas réellement. Par contre en suivant l'URL du lien "details", on peut récupérer la longitude et la latitude. 
+  # Le  code suivant permant de récupérer cet URL appelé ici "code."
+  # Selection de la node ou se trouve l'information que l'on recherche (<a class="btn btn-default btn-xs details" href="details.php?place_id=179716155">details</a>)
+  HTML=url.get %>% html_nodes('a') %>% as.character()
+  # récupératoin des lignes contenant 'details.php
+  HTML=grep('details.php',HTML,value=TRUE)
+  # récupération du code pour passer à la page suivante
+  HTML=strsplit(HTML,'details')[[1]][3]
+  HTML=strsplit(HTML,'=')[[1]][2]
+  code=stringr::str_extract(HTML,'[0-9]*')
+  
+  # Lecture du code HTML de la deuxième page.
+  URL=paste0('http://nominatim.openstreetmap.org/details.php?place_id=',code)
+  url.get=xml2::read_html(URL)
+  
+  # La latitude et la longitude sont dans le code suivant : <tr><td>Centre Point</td><td>48.86114765,2.33802698859948</td></tr>
+  HTML=url.get %>% html_nodes('tr') %>% as.character()
+  HTML=grep('Centre Point',HTML,value=TRUE)
+  HTML=strsplit(HTML,'<td>')[[1]][3]
+  return(strsplit(stringr::str_extract(HTML,'[0-9]*.[0-9]*,[0-9]*.[0-9]*'),'[,]')[[1]])
+}
+
+# Fonction MAPE
+MAPE=function(preds,reel){
+  return(sum(abs(preds-reel)/reel)/length(reel))
+}
+
+# Fonction MAPE pour XGBOOST
+
+evalerror_MAPE=function(preds,dtrain){
+  labels= getinfo(dtrain,"label")
+  err=as.numeric(sum(abs(preds-labels)/labels)/length(labels))
+  return(list(metric="MAPE",value=err))
+}
+
+split_in_equal_parts <- function(x, breaks = NULL,q=20) {
+  if(is.null(breaks)) breaks <- unique(quantile(x, 0:q/q))
+  x <- cut(x, breaks, include.lowest = TRUE, right = FALSE)
+  levels(x) <- paste(breaks[-length(breaks)], ifelse(diff(breaks) > 1, c(paste("-", breaks[-c(1, length(breaks))] - 1, sep = ""), "+"), ""), sep = "")
+  return(x)
+}
+
+evaluate_calibration=function(predicted_values,actual_values,q=50){
+  
+  calibration_moy_reel=tapply(X = actual_values,INDEX = split_in_equal_parts(predicted_values,q = q),FUN = mean)
+  calibration_moy_pred= tapply(X = predicted_values,INDEX =  split_in_equal_parts(predicted_values,q = q),FUN = mean)
+  
+  t=cbind(calibration_moy_reel=tapply(X = actual_values,INDEX = split_in_equal_parts(predicted_values,q = q),FUN = mean)
+          ,
+          alibration_moy_pred= tapply(X = predicted_values,INDEX =  split_in_equal_parts(predicted_values,q = q),FUN = mean)
+          )        
+  
+  
+  R2=round(summary(lm(calibration_moy_reel ~ calibration_moy_pred))$r.squared,digits=4)
+  # return(R2)
+  res=list("calibration_moy_reel"=calibration_moy_reel,"calibration_moy_pred"=calibration_moy_pred,"predictions"=predicted_values,"R2"=R2)
+  #par(mfrow=c(2,1))
+  plot(main=paste0("QQ-PLOT (regroupement par quantile de 0.2%)",", R² = ",R2),
+       calibration_moy_pred,
+       calibration_moy_reel,            
+       type="b",col="black",lty=1,ylab="Cout moyen observation",lwd=2,xlab="Cout moyen predit"
+  )
+  abline(0,1,col="red")
+  
+  # plot(main=paste0("Ecart par tranche tarifaires",",Ecart moyen =",mean(t[,1]/t[,2])-1),
+  #      calibration_moy_pred,
+  #      t[,1]/t[,2],            
+  #      type="b",col="black",lty=1,ylab="Cout moyen observation",lwd=2,xlab="Cout moyen predit"
+  # )
+  # abline(1,0,col="red")
+}
+```
+
+En amont de la présentation du jeu de données étudié, le programme charge les packages qui seront nécessaires à l'étude :
+
+```{r install_package,warning=FALSE,message=FALSE}
+# Installation des différents packages
+install.load.packages('rgdal','htmltools','spatstat','ggmap','osmar','rvest','ggplot2','plotly','googleVis','threejs','cowplot','dplyr','knitr','rpart','rpart.plot','xgboost','htmlwidgets','IRdisplay','caret','data.table',"gridExtra","magick",'cplm',"RColorBrewer","classInt",'raster','leaflet')
+
+# if (!require('devtools')) install.packages('devtools')
+# devtools::install_github('rstudio/leaflet') # la version Github permet de fixer certains problèmes, notamment l'export dynamique en HTML
+#library(leaflet)
+knitr::opts_chunk$set(echo = TRUE)
+op <- options(gvis.plot.tag='chart')
+```
+
+# Objet du notebook
+
+**Il s'agit de données mises à disposition par le site Airbnb (http://insideairbnb.com/get-the-data.html). Le Notebook a pour objectif de :**
+  
+  - **Visualiser sur une carte de Paris les différents biens proposés par Airbnb, puis d'analyser les variables de la base.**
+  
+  - **Proposer des enrichissements envisageables afin de différencier les différents bien (proche d'un lieu touristique, d'une station de métro,...)**
+  
+  - **Essayer de prédire le prix des différents biens Airbnb afin d'en déduire les variables explicatives.**
+
+**Remarques :**
+
+  - Certaines lignes étant incomplètes (nombre de chambres par exemple) elles sont supprimées de l'étude.
+  
+  - Dans le cas où le lancement du code .rmd conduirait à des problèmes d'encodage, il suffit de réouvrir le code en spécifiant l'encodage (File->reopen with encoding sous Rstudio).
+  
+  - Le code présente de nombre morceaux dont l'option "évaluation" est mise sur FALSE. De même, des chargements et lectures de fichiers .RDS sont régulièrement effectués. Ceci est dû aux temps de traitement relativement long de certains bouts de codes (le chargement des .RDS évite de refaire tourner une grande partie du code à chaque création du HTML).
+  
+  - Pour un meilleur affichage des cartes il est préférable, d'être connecté à internet.
+
+  - Entre le début du projet et sa finalisation, le site a mis à jour le fichier Airbnb Paris (octobre 2016 à l'époque, juin 2017 à fin juin).  
+  
+# Base initiale
+
+## Courte description
+
+**Après un léger prétraitement, la base mise à disposition par le site Airbnb est constituée de 49753 observations et de 12 variables. Le fichier données correspond à la fusion entre le fichier listing et le fichier listing détail. In fine cela conduit à une base de 15 colonnes dont le format et un exemple de valeurs sont présentés ci-après :**
+
+```{r Donnees0, include=TRUE,eval=FALSE}
+# Chargement du fichier listing
+listing=read.csv(paste0(getwd(),"//Data//listings.csv"),header = TRUE,sep = ",",dec=".",fill = TRUE)
+
+# Chargement de la base detail et croisement avec le fichier initial
+Detail=read.csv(paste0(getwd(),'//Data//listings_detail.csv'),header=TRUE,fill=TRUE)
+Detail=Detail[,c('id',"property_type","room_type","accommodates","bathrooms","bedrooms","bed_type",'amenities','zipcode')]
+donnees=merge(listing,Detail,by.x='id',by.y='id')
+donnees=donnees[,c('id','latitude','longitude','price',"minimum_nights",'Grille','Arrondissement','Metro','property_type','room_type.y','accommodates','bathrooms','bedrooms','bed_type')]
+donnees=subset(donnees,!is.na(donnees$bedrooms) & !is.na(donnees$bathrooms))
+saveRDS(donnees,file=paste0(getwd(),\\Data\\donnees.rds))
+```
+
+```{r Donnees0_1, include=TRUE,eval=TRUE}
+donnees=readRDS(paste0(getwd(),'\\Data\\donnees.rds'))
+str(donnees)
+```
+
+```{r results ='asis',tidy=TRUE, eval=TRUE}
+# Visualisation des 100 premières lignes
+PopTable <- gvisTable(donnees[1:100,],options=list(page='enable'))
+plot(PopTable)
+```
+** **
+
+**Certains noms étant peu explicites, ils sont traduits ci-après :**
+
+** **
+
+
+Variable Name | Traduction                    |Commentaire   
+--------------|-------------------------------|----------------
+Id            | Identifiant du bien           | Pas d'impact
+latitude      | Latitude                      | Permet l'enrichissement
+longitude     | Longitude                     | Permet l'enrichissement
+**price**     | **Prix**                      | **Variable à expliquer**
+minimum night | Nb minimum de nuits à réserver| Non retenu en première approche
+property_type | Type de bien                  | 20 catégories 
+room_type.y   | Caractère privatif            | Ce que l'on peut réserver : totalité, chambre, rien
+accommodates  | Capacité d'accueil            | 1 à 16 !
+bedrooms      | Nombre de chambres            | 1 à 10 !
+bed_type      | Type de lit                   | 5 catégories
+arrondissement| arrondissement                | 20 arrondissements
+
+** **
+
+**La surface du bien n'étant pas indiquée dans les données récupérées un rapide scrapping a été tenté afin de récupérer cette information au travers du descriptif du bien. Cette tentative (qui pourrait être approfondie) répondant au problème dans seulement 4% des biens, on ne retient donc pas cette valeur par la suite (c'est d'ailleurs une explication de la difficulté à expliquer l'hétérogénéité du prix des différents biens).**
+
+```{r Donnees1, include=TRUE,eval=FALSE}
+# Recherche de la surface du bien dans le descriptif.
+M2=data.frame('Surface'=rep(0,nrow(donnees)))
+for (i in 1:nrow(donnees)){
+  temp=unlist(strsplit(as.character(donnees$name[i]),split=' ')) # On découpe la description de chaque bien en mot.
+  M2$Surface[i]=try(gsub('m2','',temp[grep('^([0-9]+)(m2)$',temp)[1]])) # On récupère les mots en m2, si plusieurs surface sont récupérée pour un même bien, on conserve la première (point à améliorer)
+}
+M2$Find="0"
+M2$Find[!is.na(M2$Surface)]="1"
+```
+
+```{r Donnees1_1, include=TRUE,eval=TRUE}
+M2=readRDS(file=paste0(getwd(),'\\Data\\M2.rds'))
+# Affichage du % de biens pour lequel on trouve une surface.
+Traite=M2 %>% group_by(Find) %>% summarise(length(Find)/nrow(M2))
+print(Traite)
+```
+
+**Certains biens semblant présenter des prix élevés, on sépare la base en deux (en se basant sur le quantile à 99.5% des prix de location) :**
+
+- **des biens dont le prix de la nuit est inférieur à 501 euros**
+
+- **le reste des biens (de 501 euros à 6000 euros)**
+
+**Une analyse de la densité des deux sous-bases est présentée ci-après :**
+
+```{r Donnees2, include=TRUE}
+# indicatrice de position du prix par rapport au quantile à 99.5%
+donnees$Cher='0'
+donnees$Cher[donnees$price>quantile(donnees$price,0.995)]='1'
+# Prix moyen par catégorie
+Moyenne=donnees %>% group_by(Cher) %>% summarise(Prix=mean(price), Nb=length(Cher))
+# Utilisation de plotly pour avoir plus d'informations sur le graphique
+p=ggplot(donnees, aes(price,fill=Cher))+ geom_density(alpha=0.4)+
+  geom_vline(data=Moyenne, aes(xintercept=Prix, color=Cher),linetype="dashed")
+ggplotly(p)
+Etrange=subset(donnees,donnees$Cher==1)
+Normaux=subset(donnees,donnees$Cher==0)
+```
+**La densité des deux types de biens montrent une différence notable. En l'absence de données complèmentaires (m², commodités,etc...) il a été décidé de concentrer la suite de l'étude sur les biens dits "peu chers". Une localisation de ces données à l'état brut est présentée ci-après :**
+
+## Courte visualisation
+
+**En téléchargeant les zones IRIS de la carte de France (https://www.data.gouv.fr/fr/datasets/contour-des-iris-insee-tout-en-un/), il est possible de réaliser une première visualisation :**
+
+```{r Donnees3, include=TRUE,eval=TRUE,message=FALSE}
+# Récupération de la base IRIS puis on trace les zones de densités (9 zones sont autorisées)
+localDir <- paste0(getwd(),"\\Data\\iris-2013-01-01") # Chemin du dossier
+layerName <- "iris-2013-01-01" # lecture du fichier .shp
+contours <- readOGR(dsn=localDir, layer=layerName)
+
+# Le fichier est codé en système WGS84 (et limite des contours). Il n'y a donc pas besoin de le convertir
+
+# Extraction des IRIS de Paris : on retient les deux premiers chiffres du code département
+contours75 <- subset(contours, substr(DEPCOM,1,2)=="75")
+
+# Les coordonnées de nos points AiRBnb
+pts <- data.frame(x=Normaux$longitude,y=Normaux$latitude)#x = longitude, y = latitude
+coordinates(pts) <- ~x+y
+# Affectation du système de coordonnées de la couche de contours
+proj4string(pts) <- proj4string(contours75)
+geocodage <- data.frame(pts, over(pts, contours75))
+# sum(is.na(geocodage$IRIS))/nrow(geocodage)
+# 0.01% seulement des biens AirBnb n'ont pas trouvé de zone IRIS.
+
+IRIS_AirBnb=geocodage %>% group_by(IRIS) %>% summarise(Poids=length(IRIS)/nrow(geocodage))
+
+# Ajout du % de AirBnb dans les données spatiales
+contours75@data <- data.frame(contours75@data, 'Poids'=IRIS_AirBnb$Poids[match(contours75@data$IRIS,IRIS_AirBnb$IRIS)])
+contours75=subset(contours75,!is.na(contours75@data$Poids)) # suppresion des 20 IRIS non trouvé dans la base AirBnb
+
+# Découpage du temps de trajet en 9 classes via la méthodes des quantiles : idenfication des bornes (breaks, ou brks)
+classTemps <- classIntervals(contours75@data$Poids, 9, style = "quantile")
+# Choix d'une palette de couleur pour les 10 catégories
+palette <- brewer.pal(n = 9, name = "YlOrRd")
+
+# Application de ce découpage à variable Poids, sauvegarde dans temps_cat
+# On stocke, pour chaque observation, la valeur de la couleur correspondante
+contours75@data$Poids_cat <- as.character(cut(contours75@data$Poids, breaks = classTemps$brks, labels = palette, include.lowest = TRUE))
+
+# On sauvegarde ensuite le fichier dans un .png
+#png(file = paste0(getwd(),'\\Data\\contours75.png'), width = 800, height = 700)
+plot(contours75, col = contours75@data$Poids_cat, border = "black")
+
+```
+
+**Les graphiques dynamiques leaflet offrent cependant une méthode de visualisation plus agréable :**
+
+```{r Viz1, echo=TRUE}
+m=leaflet() %>% addTiles() %>%
+  # Les 3 formats de carte envisageables
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  
+  # Boite de control des 3 formats de carte envisageables
+  addLayersControl(position = 'bottomright',
+                   baseGroups = c("Topographical", "Road map", "Satellite"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+
+  # Ajout des point AirBnB avec une clusterisation visuelle.
+  addMarkers(~as.numeric(Normaux$longitude),~as.numeric(Normaux$latitude),data=Normaux,
+                   clusterOptions = markerClusterOptions())
+
+m  
+```
+
+** **
+
+**On va par la suite chercher à prédire ou du moins comprendre la volatilité des prix de la base Airbnb.**
+
+** ** 
+
+# Géolocalisation
+  
+**Une première carte leaflet est réalisée en téléchargeant une carte des arrondissements Parisiens afin de visualiser la répartition des biens et des prix selon cette maille. Afin d'aller au-delà de la simple notion d'arrondissement parisien, un maillage de Paris a été créé (900 cases créant un carré de 30x30). Il permet ainsi de détecter des potentielles zones de densités et ajouter des informations sur la carte.**
+  
+```{r Gestion_arrondissements, include=TRUE,eval=TRUE}
+Taille = 30
+# La carte de Paris est uniquement utilisée pour obtenir les latitudes et longitudes max de la capitale. Cela permet ainsi que définir les bornes du maillage.
+Arrondissement.Paris.Coord=readRDS(file=paste0(getwd(),'\\Data\\Arrondissement.Paris.Coord.RDS'))
+attach(Arrondissement.Paris.Coord)
+# On construit alors un maillage 30 sur 30
+Grille_lat = data.frame('lat' = seq(min(latitude),max(latitude),by = (max(latitude) - min(latitude)) / Taille),'Grille' = c(0:Taille))
+Grille_long = data.frame('long' = seq(min(longitude),max(longitude),by = (max(longitude) - min(longitude))/Taille),'Grille' = c(0:Taille))
+detach(Arrondissement.Paris.Coord)
+Normaux$Grille=0
+# A l'aide de la fonction Grille, on indique pour chaque point dans quelle grille il est situé (permettra de gagner du temps pour des calculs de distances.)
+Normaux$Grille=Position_Grille(lat=Normaux$latitude,long=Normaux$longitude,Taille=Taille)
+
+# On a précédemment récupéé un shapefile des arrondissements parisien pour les leaflets que l'on va tracer par la suite
+# Récupération de la carte des arrondissements 
+Arrondissement.Paris = readRDS(paste0(getwd(), '\\Data\\Arrondissement.RDS'))
+Arrondissement.Paris$nom = stringr::str_extract(Arrondissement.Paris$nom, '[0-9]+') #Mise au format des noms d'arrondissement : passage de 'Paris 15e Arrondissement' à 15.
+Arrondissement.Paris$nom[nchar(Arrondissement.Paris$nom) == 1] = paste0('0', Arrondissement.Paris$nom[nchar(Arrondissement.Paris$nom) ==1])# Ajout d'un zéro pour les arrondiseement allant de 1er au 9ème (pour être homogène avec le format de la base AirBnb)
+
+# Ajout du prix moyen et du nombre d'offre par arrondissement (on tracera ces formes géométriques dans les codes suivants)
+Arrondissement.Paris$Prix = Arrondissement.Paris$Nb_Offre = 0
+Localisation=Normaux %>% group_by(arrondissement) %>% summarise(Prix=mean(price), Nb=length(arrondissement))
+
+for (i in 1:length(Arrondissement.Paris$Prix)) {
+  Arrondissement.Paris$Prix[i] = Localisation$Prix[Localisation$arrondissement ==Arrondissement.Paris$nom[i]]
+  Arrondissement.Paris$Nb_Offre[i] = Localisation$Nb[Localisation$arrondissement ==Arrondissement.Paris$nom[i]]
+}
+```
+## Par zone d'offres
+
+```{r Donnees_NormauX_Visualisation1, include=TRUE,warning=FALSE}
+# Zone de forte densité de nombres de biens
+X=cbind(Normaux$longitude,Normaux$latitude)
+kde2d <- KernSmooth::bkde2D(X, bandwidth=c(bw.ucv(X[,1]),bw.ucv(X[,2])))
+CL=contourLines(kde2d$x1 ,kde2d$x2 ,kde2d$fhat)
+# Permettra de gérer les zones à très faible densité
+Grille=Normaux %>% group_by(Grille) %>% summarise(Prix=mean(price),Nb=length(price))
+Quant=quantile(Grille$Nb,0.25)
+
+# Deux graphiques sont présentés : par arrondissement et par zone de densité
+Group_maillage <- c("Par arrondissement", "Par zone")
+
+# Dans le cas du graphique par arrondissement, la parallette graphique sera appliquée sur les déciles de prix
+pal <-  leaflet::colorNumeric(c("blue", "green", "red"), 0:1)
+
+# Carte des nombres par arrondissement
+m=leaflet() %>% setView(lat=48.866667, lng=2.333333, zoom = 12) %>% 
+  addTiles()%>%
+  addPolygons(data = Arrondissement.Paris,
+              fillColor = ~pal(round(match(Arrondissement.Paris$Nb_Offre,sort(Arrondissement.Paris$Nb_Offre))/2)/10),#Position croissante dans les 20 prix.
+              fillOpacity = 0.5,
+              color = "#BDBDC3", 
+              weight = 1,
+              group=Group_maillage[1], # Permettra d'activer ce polynome si l'on choisit le premier groupe maillage
+              popup= paste0(gsub('fr:','',Arrondissement.Paris$wikipedia), 
+                            "<br><strong> Nombre d'offres : </strong>", 
+                            paste0(Arrondissement.Paris$Nb_Offre)))
+
+# Carte des nombres par zone
+# En premier lieu, on trace en vert, l'intégralité du maillage et qui correspondra au nombre moyen (en se basant sur le quadrillage parisien)
+for (lat in 0:(Taille-1)){
+  for(lon in 0:(Taille-1)){
+    if(!((lat*Taille+1+lon) %in% Grille$Grille)) next
+    if (Grille$Nb[Grille$Grille==(lat*Taille+1+lon)]<Quant) {fillColor = "blue"} else {fillColor = "green"} # bleu si peut de point, vert sinon
+    m=m %>%
+      # AJout des 900 rectangles grace aux coordonnées de la grille, 
+      addRectangles(stroke = FALSE, 
+                    lng1=Grille_long$long[Grille_long$Grille==lon],
+                    lat1=Grille_lat$lat[Grille_lat$Grille==lat],
+                    lng2=Grille_long$long[Grille_long$Grille==lon+1], 
+                    lat2=Grille_lat$lat[Grille_lat$Grille==lat+1],
+                    fillColor=fillColor,
+                    group=Group_maillage[2],
+                    fillOpacity = 0.2)
+  }
+}
+#Ensuite, on trace en rouge les zones à très forte densité.
+for (i in 1:length(CL)){
+  m=m %>% addPolygons(CL[[i]]$x,CL[[i]]$y,fillColor = "red", stroke = FALSE,group=Group_maillage[2],fillOpacity = 0.2)
+}
+
+m=m %>% addLegend(position='topright',
+                  colors=c("red", "green", "blue"),
+                  opacity = 1,
+                  title = "Nombre d'offres",
+                  labels=c("Beaucoup","Dans la moyenne","Peu"),
+                  labFormat = labelFormat(suffix = "%")) %>% 
+  
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  # Layers control
+  addLayersControl(position = 'bottomright',
+                   baseGroups = c("Topographical", "Road map", "Satellite"),
+                   overlayGroups =  Group_maillage,
+                   options = layersControlOptions(collapsed = FALSE))
+m
+```
+
+** ** 
+
+**On observe les élèments suivants :**
+  
+  - **En moyenne, les arrondissements présentant le plus grand nombres de biens en location sont le XV^ème^ et le nord de Paris.**
+  
+  - **En affinant la carte localisant les biens et en ajoutant des zones de densités on observe deux zones de concentration : Montmartre et l'ouest du Marais.**
+
+
+## Par zone de prix
+
+**On analyse la présence de zone de prix en présentant les densités de prix faibles (inférieur au quantile à 10% ou supérieur au quantile à 90%).**
+
+```{r Donnees_NormauX_Visualisation2, include=TRUE,warning=FALSE}
+# On extraie deux sous partie de la base : la zone dont les prix sont dans le premier décile puis la zone ou les prix sont dans le dernier décile 
+Quant=0.1
+temp1=subset(Normaux,Normaux$price > quantile(Normaux$price,0) & Normaux$price<quantile(Normaux$price,Quant))
+temp2=subset(Normaux,Normaux$price > quantile(Normaux$price,1-Quant) & Normaux$price<quantile(Normaux$price,1))
+
+# On calibre des zones de densités sur ces deux sous bases.
+Contour=list()
+for (i in c('Cher','Peu Cher')){
+if (i=='Peu Cher') temp=temp1 else temp=temp2
+X=cbind(temp$longitude,temp$latitude)
+kde2d <- KernSmooth::bkde2D(X, bandwidth=c(bw.ucv(X[,1]),bw.ucv(X[,2])))
+Contour[[i]]=contourLines(kde2d$x1 ,kde2d$x2 ,kde2d$fhat)
+}
+# Deux graphiques sont présentés : par arrondissement et par zone de densité
+Group_maillage <- c("Par arrondissement", "Par zone")
+# valeur prise par la legende
+
+# La parallette graphique sera appliquée sur les déciles de prix
+pal <-  leaflet::colorNumeric(c("red", "green", "blue"), 0:1)
+
+# Carte des Prix par arrondissement
+m=leaflet() %>% setView(lat=48.866667, lng=2.333333, zoom = 12) %>% 
+  addTiles()%>%
+  addPolygons(data = Arrondissement.Paris,
+              fillColor = ~pal(round(match(Arrondissement.Paris$Prix,sort(Arrondissement.Paris$Prix))/2)/10),
+              fillOpacity = 0.5,
+              color = "#BDBDC3",
+              weight = 1,
+              group=Group_maillage[1],
+              popup= paste0(gsub('fr:','',Arrondissement.Paris$wikipedia), 
+                            "<br><strong> Prix moyen : </strong>", 
+                            paste0(Arrondissement.Paris$Prix)))
+# Carte des prix par zone
+# En premier lieu, on trace en vert, l'intégralité du maillage et qui correspondra au prix moyen (en se basant sur le quadrillage parisien)
+for (lat in 0:(Taille-1)){
+  for(lon in 0:(Taille-1)){
+    if(!((lat*30+1+lon) %in% Grille$Grille))next
+    m=m %>%
+      addRectangles(stroke = FALSE,
+                    lng1=Grille_long$long[Grille_long$Grille==lon],
+                    lat1=Grille_lat$lat[Grille_lat$Grille==lat],
+                    lng2=Grille_long$long[Grille_long$Grille==lon+1], 
+                    lat2=Grille_lat$lat[Grille_lat$Grille==lat+1],
+                    fillColor = "green",group=Group_maillage[2],fillOpacity = 0.2)
+  }
+}
+#Ensuite, on trace en rouge les zones à prix faible et en bleu les zones cher
+for (i in 1:length(Contour[['Peu Cher']])){
+  m=m %>% addPolygons(Contour[['Peu Cher']][[i]]$x,Contour[['Peu Cher']][[i]]$y,fillColor = "red", stroke = FALSE,group=Group_maillage[2],fillOpacity = 0.2)
+}
+for (i in 1:length(Contour[['Cher']])){
+  m=m %>% addPolygons(Contour[['Cher']][[i]]$x,Contour[['Cher']][[i]]$y,fillColor = "blue", stroke = FALSE,group=Group_maillage[2],fillOpacity = 0.2)
+}
+m=m %>% addLegend(position='topright',
+                  colors=c("red", "green", "blue"),
+                  opacity = 1,
+                  title = "Prix",
+                  labels=c("Peu cher","Dans la moyenne","Cher"),
+                  labFormat = labelFormat(suffix = "%")) %>% 
+  
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  # Layers control
+  addLayersControl(position = 'bottomright',
+                   baseGroups = c("Topographical", "Road map", "Satellite"),
+                   overlayGroups =  Group_maillage,
+                   options = layersControlOptions(collapsed = FALSE))
+m
+```
+
+** ** 
+
+**On observe les élèments suivants :**
+  
+  - **En moyenne, les biens les plus chers sont situés dans le coeur de Paris et dans le XVI^ème^ arrondissement**
+  
+  - **Les zones de densités mettent en avant Saint Germain des Près, le marais et la zone "grand boulevard"**
+  
+  
+# Présentation des variables de la base Airbnb
+
+**La réparition des prix semblant plus complexe que la simple notion spatiale, les autres variables de la base sont analysées.**
+
+## Types de biens
+
+**Compte tenu du nombre élevé de modalités de la catégories "type de bien", une analyse de cette variable est présentée ci-après :**
+
+```{r Stat1, echo=TRUE, warning=FALSE,message=FALSE}
+# Affichage des biens par type d'appartement et charactère privatif
+kable(table(Normaux$property_type,Normaux$room_type.y),caption ='Nombre par type de biens 
+et caractère privatif')
+```
+
+
+**Certains champs sont étonnants : 46 maisons entières sont dans la catégorie *Bed et Breakfeast*, une tente, un tipi et une cabane sont proposés sur Paris. Au delà des ces élèments étonnats, cinq catégories semblent apparaître :**
+
+- **des appartements et condominium (assimilable à un appartement))** 
+
+- **des maisons (et maison de ville et villa)**
+
+- **des bed and breakfast**
+
+- **des lofts**
+
+- **des biens atypiques (tipi,igloo,...) **
+
+**La validation de cette intuition de regroupement est effectuée (et légèrement invalidée) à l'aide d'un algorithme CART**
+
+```{r Stat2, include=TRUE}
+# Application de l'abre (pré-entrainé en dehors au niveau du paramètre cp)
+Arbre=rpart(price~property_type,data=Normaux,control=rpart.control(cp=6.035917e-05,minsplit=50,list="gini"))
+rpart.plot::prp(Arbre,extra=1)
+```
+
+**Sur la base de l'algorithme CART, 6 catégories apparaissent :**
+
+  - **des biens atypiques : Cave, Dorm, Tent, Treehouse** 
+  
+  - **des condominium : Cabin, Camper/RV, Condominium, Earth House, Other, Tipi**
+  
+  - **des bed and breakfast**
+  
+  - **des appartements**
+  
+  - **des maisons : House, Loft, Townhouse**
+  
+  - **des villas et péniches : Boat,Villa**
+  
+**Ceci conduit à la répartition suivante : **
+
+```{r Stat2_1, include=TRUE}
+# Regroupement par catégories
+Categorie=c('Cat1','Cat2','Cat3','Cat4','Cat5','Cat6')
+Cat1=c('Cave','Dorm','Tent','Treehouse')
+Cat2=c('Cabin','Camper/RV','Condominium','Earth House','Other','Tipi')
+Cat3=c('Apartment')
+Cat4=c('Bed & Breakfast')
+Cat5=c('House','Loft','Townhouse')
+Cat6=c('Boat','Villa')
+Normaux$Type='Etrange'
+Normaux$Type[Normaux$property_type %in% Cat2]='Condominium'
+Normaux$Type[Normaux$property_type %in% Cat3]='Appart'
+Normaux$Type[Normaux$property_type %in% Cat4]='B&B'
+Normaux$Type[Normaux$property_type %in% Cat5]='Maison'
+Normaux$Type[Normaux$property_type %in% Cat6]='Villa-Boat'
+
+kable(table(Normaux$property_type,Normaux$Type),caption='Agrégation des types de biens')
+Normaux$property_type=NULL
+
+```
+**La densité de prix de ces six catégories est présentée ci-après :**
+```{r Stat2_2, include=TRUE}
+p=ggplot(data=subset(Normaux,Normaux$Type %in% c('Etrange','Condominium','Appart')),aes(x=price)) +geom_density(fill='blue',color='blue')+facet_grid(~Type)
+ggplotly(p)
+
+p=ggplot(data=subset(Normaux,Normaux$Type %in% c('B&B','Maison','Villa-Boat')),aes(x=price))+geom_density(fill='blue',color='blue')+facet_grid(~Type)
+ggplotly(p)
+```
+**Les graphiques de densités montrant des différences (appartements et condominium pourraient tout de même être asimilés) ces 6 catégories sont conservées dans la suite de l'analyse et la variable *property_type* est supprimée.**
+
+## Impact du caractère privatif
+
+**Une fois analysé l'impact de la variable type, un traitement identique est appliqué sur la variable gérant le caractère privatif. Trois catégories sont présentes avec une densité de prix très différentes dans chaque cas :**
+  
+```{r Stat3, include=TRUE}
+kable(Normaux %>% group_by(room_type.y) %>% summarise('Pourcentage de biens' =length(room_type.y)/nrow(Normaux),Prix=mean(price), Chambre = mean(bedrooms), 'Salle de Bain' = mean(bathrooms)),caption ='Caractéristiques moyennes par type de bien')
+
+p = ggplot(data=Normaux,aes(x=price)) + geom_density(fill='blue',color='blue')+facet_grid(~room_type.y)
+ggplotly(p)
+```
+**Ce champs est donc conservé intacte pour la suite de l'étude.**
+
+## Autres variables (nombre de nuit, type de lit,...)
+
+**Pour finir, on analyse les autres variables descriptives présentes dans la base.**
+
+### Nombre de nuit minimal
+
+**75% de la base étant regroupés dans les catégories 1,2 ou 3 nuits au minimum, la variable "minimum_nights" est regroupée en 4 catégories : 1, 2, 3, 4+.**
+
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+# On vérifie si le nombre de nuite permettrait une bonne explication du prix (via une simple régression linéaire)
+lin=lm(price~minimum_nights,data=Normaux)
+p= ggplot(data=Normaux,aes(x=minimum_nights,y=price))+geom_point()+geom_smooth()+ ggtitle(paste0('R2 ajusté :', summary(lin)$r.squared))
+p
+
+# Statistiques de prix et de nombre de biens par nombre de nuits minimales
+Stat_Night=Normaux %>% group_by(minimum_nights) %>% summarise('Pourcentage' =length(minimum_nights)/nrow(Normaux),Prix=mean(price))
+Stat_Night$minimum_nights=as.factor(Stat_Night$minimum_nights)
+# Graph pour visualisation
+Bubble <- gvisBubbleChart(Stat_Night, idvar="minimum_nights", 
+                          xvar="Prix", yvar="Pourcentage",
+                          colorvar="minimum_nights",
+                          sizevar="Pourcentage", 
+                          options=list(
+                            title ={"Pourcentage d'offres et prix moyen par nombre de nuit minimale"},
+                            hAxis = "{title:'Prix moyen'}",
+                            vAxis = "{title:'Pourcentage de la base',minValue:-0.1,maxValue:0.5}",width=660, height=500)
+)
+
+plot(Bubble)
+# Parassage à 4 catégories
+Normaux$Nuit='4+'
+for (i in 1:3){Normaux$Nuit[Normaux$minimum_nights==i]=paste0(i)}
+```
+
+**En première approche le nombre de nuits à réserver à minima ne semble pas être une variable très explicative**
+
+### Type de couchage
+
+**Compte tenu de la répartition des différents types de couchages, ils sont regroupé en deux catégories : lit (97% des biens) et autre (3% des biens).**
+
+```{r results='asis',tidy=TRUE, eval=TRUE}
+# graphique du nombre de biens par type de lit
+G_NB = gvisPieChart(Normaux %>% group_by(bed_type) %>% summarise('Pourcentage de biens' =length(bed_type)/nrow(Normaux)),options=list(width=500, height=500,title ='Pourcentage de biens par type de lit'))
+
+# Graphique du prix moyen par type de lit.
+G_Price <- gvisBarChart(Normaux %>% group_by(bed_type) %>% summarise('Price'=mean(price)),
+xvar='bed_type',
+yvar='Price',
+options=list(width=500, height=500,
+title='Prix par type de couchage'))
+
+# Merge des graphiques côte à côte
+plot(gvisMerge(G_NB ,G_Price, horizontal=TRUE))
+
+# Passage à deux catégories
+Normaux$Lit='autre'
+Normaux$Lit[Normaux$bed_type=='Real Bed']='Lit'
+Normaux$bed_type=NULL
+```
+
+### Accomodate : nombre de personnes
+
+**75% des biens proposent de 2 à 5 personnes. Les prix suivant en moyenne une évolution linéaire, on se propose de conserver cette variable en l'état.**
+
+```{r results='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+G_NB = gvisPieChart(Normaux %>% group_by(as.factor(accommodates)) %>% summarise('Pourcentage de biens' =length(accommodates)/nrow(Normaux)),options=list(width=500, height=500,title ='Pourcentage de biens par nombre de couchages'))
+
+G_Price <- gvisBarChart(Normaux %>% group_by(accommodates) %>% summarise('Price'=mean(price)),
+xvar='accommodates',
+yvar='Price',
+options=list(width=500, height=500,
+title='Prix par nombre de couchages'))
+plot(gvisMerge(G_NB ,G_Price, horizontal=TRUE))
+```
+
+```{r Stat4, include=TRUE,warning=FALSE}
+# On regarde si le nombre de personnes pouvant être acceuilli permet de prédire directement les prix. 
+lin=lm(price~accommodates,data=Normaux)
+p= ggplot(data=Normaux,aes(x=accommodates,y=price))+geom_point()+geom_smooth()+ ggtitle(paste0('R2 ajusté :', summary(lin)$r.squared))
+p
+```
+
+**Le nombre de personnes pouvant être logé dans le bien présente un impact certain. Mais uniquement en moyenne.**
+
+# Enrichissement
+
+**Afin d'améliorer la compréhension du prix des biens Airbnb Parisien, un enrichissement a été effectué à l'aide de quelques données *open source* :**
+
+Cible         | Lien   
+--------------|-------------
+Métro         |https://data.ratp.fr/explore/?sort=modified
+Monuments    |http://monumentsdeparis.net/
+Prix M^2^     |http://www.meilleursagents.com/prix-immobilier/paris-75000/
+Restaurant    |https://www.sirene.fr/sirene/public/accueil
+
+
+## Métro
+
+**Ce premier enrichissement a pour objectif de déterminer si la distance à la station de métro la plus proche présente un impact sur le prix du bien. Afin de réduire les temps de calcul (un calcul complet étant impossible), les étapes suivantes ont été réalisées :**
+
+- **Pour chaque bien, on récupère les stations de métro situées dans la grille contenant le bien AirBnb. La zone de recherche correspond au 9 cases entourant chaque logement (afin de solutionner les problèmes de frontières).**
+
+- **On calcule ensuite la distance du bien aux différentes stations sélectionnées. Pour plus de précision, une distance géodésique a été retenue.**
+
+**La plupart des biens sont situés à moins de 600 mètres d'un transport en commun (bus, métro,...)**
+
+```{r Metro_Ajout,eval=FALSE}
+# Récupère les données téléchargées sur le site de la ratp.
+Metro=read.csv(paste0(getwd(),'//Data//','positions-geographiques-des-stations-du-reseau-ratp.csv'),header=TRUE,sep=";")
+# Ajout de la variable grille (i.E position dans la grille) sur la base ratp.
+Metro$Grille = Position_Grille(lat=Metro$stop_lat,long=Metro$stop_lon,Taille)
+saveRDS(Metro,file=paste0(getwd(),'\\Data\\Metro.rds'))
+
+# Calcul pour chaque point de la base AirBnb la distance au métro (ou bus), le plus proche.
+log=NULL
+for (i in 1:nrow(Normaux)) {
+print(i/nrow(donnees))
+temp=subset(Metro,Metro_Grille(Metro$Grille,Normaux$Grille,i)) # Metro qui sont la même grille que le bien (le code retient 9 grilles pour solutionner les problèmes de bords.)
+if (nrow(temp)==0) {
+print(paste0('pas de correspondance pour la',i,'ème donnée'))
+log=c(log,i)
+Normaux$Metro[i]=0
+next
+}
+# Utilisation de la fonction distance pour calculer le point le plus proche
+else Normaux$Metro[i]=dist(lat=Normaux$latitude[i],long=Normaux$longitude[i],table_lat=temp$stop_lat,table_long=temp$stop_lon)
+}
+# Lignes de codes utilisés en phase de construction pour connaître le nombre de biens qui n'ont pas pu être gérés.
+print(paste0('Pourcentage de la base traité :',(1-length(log)/nrow(donnees))*100,'%'))
+summary(Normaux$Metro)
+saveRDS(Normaux,paste0(getwd(),'\\Data\\Normaux5Metro.rds'))
+```
+```{r Metro_Ajout2,eval=TRUE}
+temp=subset(Normaux,Normaux$Metro<1000)
+p = ggplot(data=temp,aes(x=Metro)) + geom_density(fill='blue',color='blue')
+ggplotly(p)
+```
+
+## Monuments
+
+**Ce deuxième enrichissement a pour objectif de déterminer si la distance du bien aux principaux monuments parisiens présente un impact sur le prix. Pour ce faire, les étapes suivantes sont réalisées :**
+
+- **Récupération, par webscrapping, des principaux monuments parisiens.**
+
+- **Une fois les noms récupérés, les monuments sont géolocalisés en utilisant openstreetmap.**
+
+- **Pour chaque bien, la distance à chaque monument est finalement calculée**.
+
+**En cliquant sur les markers, une photo de chaque monument est présentée.**
+```{r Enrichissement_Monuments, eval=FALSE}
+# Scrapper les monuments
+URL = 'http://monumentsdeparis.net/'
+HTML=xml2::read_html(URL)
+Liste_Monuments=HTML %>% html_nodes('li') %>% as.character() # Récupération du code entre les balises <li>
+Liste_Monuments=strsplit(Liste_Monuments,'"') # Découpage du code récupéré. On prendra le deuxième iteme ensuite
+Liste_Monuments=data.frame('Id'=unlist(lapply(Liste_Monuments,function(x){return(x[2])}))) # récupération de l'URL pour ouvrir la nouvelle page dans laquelle on aura le détail de chaque monument.
+Liste_Monuments$Image=paste0('http://monumentsdeparis.net/',Liste_Monuments$Id) # Adresse de la page ou le peut trouver l'image de chaque monument.
+# On retravaille les Id monuments pour pouvoir les utiliser ensuite
+Liste_Monuments$Id=gsub('-','+',Liste_Monuments$Id)
+Liste_Monuments$Id[Liste_Monuments$Id=='olympia']="l'olympia" # On corrige manuellement le nom olympia car sinon cela renvoie à une ville américaine sous openstreetmap.
+# Récupération des latitudes et longitudes via openstreetmap (en partant de l'adresse). Photon peut également être utilisé mais le faible nombre de monument à géocoder permet d'utiliser openstreetmap.
+for (i in 1:length(Liste_Monuments$Id)) {
+  lieu=Liste_Monuments$Id[i]
+  print(lieu)
+  scrap=try(Scrap_Map(lieu))
+  Liste_Monuments$lat[i]=try(scrap[1])
+  Liste_Monuments$long[i]=try(scrap[2])
+}
+
+Liste_Monuments$Id=gsub('[+]',' ',Liste_Monuments$Id) # Remise au format du texte des lieu
+Liste_Monuments=Liste_Monuments[-grep('Error',Liste_Monuments$lat),] # Suppression lieux non reconnus.
+saveRDS(Liste_Monuments,file=paste0(getwd(),'\\Data\\Liste_Monuments.RDS')) 
+
+URL_Image=list()
+Image=list()
+Compteur=0
+
+# Scrapping des images (un code particulier est créé car l'URL lié à l'image de chaque monument n'est pas stable
+for (i in 1:length(Liste_Monuments$Image)) {
+  Compteur=Compteur+1
+  URL = Liste_Monuments$Image[i]
+  HTML=xml2::read_html(URL)
+  HTML=HTML %>% html_nodes('a') %>% as.character()
+  Lien_Image=HTML[grep('.jpg',HTML)][1] # On récupère le bout de code qui contient une information sur l'image
+  URL_Image[[Compteur]]=strsplit(Lien_Image,'"')[[1]][2] # On le bout d'adresse URL qui nous manquait
+  
+  Image[[Compteur]]=image_read(paste0('http://monumentsdeparis.net/', URL_Image[[Compteur]])) # On lit l'image.
+}
+
+saveRDS(URL_Image,file=paste0(getwd(),'\\Data\\URL_Image.RDS'))
+saveRDS(Image,file=paste0(getwd(),'\\Data\\Image.RDS'))
+
+```
+
+```{r Enrichissement_Monuments2, eval=FALSE}
+for (j in 1:nrow(Liste_Monuments)){ # On va calculer la distance de chaque bien à chaque monuments.
+  print(j)
+  Normaux[,paste0(Liste_Monuments$Id[j])]=rep(0,nrow(Normaux))
+  for (i in 1:nrow(Normaux)){
+    Normaux[i,paste0(Liste_Monuments$Id[j])]=geosphere::distHaversine(c(Normaux$longitude[i],Normaux$latitude[i]),c(as.numeric(Liste_Monuments$long[j]),as.numeric(Liste_Monuments$lat[j])),r=6371000)
+  }  
+}
+saveRDS(Normaux,paste0(getwd(),'\\Data\\Normaux5Monuments.rds'))
+```
+
+```{r Enrichissement_Monuments4, echo=TRUE}
+# Tracer les monuments : code identique à celui des autres cartes leaflet. l'ajout se situe au niveau l'insertion d'image dans la carte
+Liste_Monuments=readRDS(file=paste0(getwd(),'\\Data\\Liste_Monuments.RDS'))
+URL_Image=readRDS(file=paste0(getwd(),'\\Data\\URL_Image.RDS'))
+m=leaflet() %>% addTiles() %>%
+  # Add tiles
+  addProviderTiles("Thunderforest.Landscape", group = "Topographical") %>%
+  addProviderTiles("OpenStreetMap.Mapnik", group = "Road map") %>%
+  addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+  
+  
+  # Layers control
+  addLayersControl(position = 'bottomright',
+                   baseGroups = c("Topographical", "Road map", "Satellite"),
+                   options = layersControlOptions(collapsed = FALSE))
+
+for (i in 1:length(Liste_Monuments$Id)){
+  file =paste0("http://monumentsdeparis.net/",URL_Image[[i]])
+  m=m %>% addMarkers(~as.numeric(Liste_Monuments$long[i]),~as.numeric(Liste_Monuments$lat[i]),
+                     data=Liste_Monuments,
+                     label =paste0(Liste_Monuments$Id[i]),
+                     popup =paste0("<img src = ", file,' height="82" width="82">"'))
+}
+m  
+```
+
+## Prix M²
+
+**Ce dernier enrichissement a pour objectif de déterminer si le prix d'un bien Airbnb dépend du prix du M^2^. Ceci est effetué en récupérant, par webscrapping, des prix moyens de vente et de location par arrondissement.**
+
+
+```{r Enrichissement_M2_1, eval=FALSE}
+# Scrappint des prix immobilier
+URL='http://www.meilleursagents.com/prix-immobilier/paris-75000/'
+url.get=xml2::read_html(URL)
+Table=html_table(xml2::read_html(URL))
+PrixM2=Table[[3]]
+# Nettoyage de la variable arrondissement et mise au format de la base AirBnb
+PrixM2$Arrondissement=gsub('Paris|arrondissement|er|ème| ','',PrixM2$Arrondissement)
+PrixM2$Arrondissement[as.numeric(PrixM2$Arrondissement)<10]=paste('0',PrixM2$Arrondissement[as.numeric(PrixM2$Arrondissement)<10],sep="")
+PrixM2$Arrondissement=as.character(PrixM2$Arrondissement)
+PrixM2$Arrondissement=gsub(' ','',PrixM2$Arrondissement)
+
+names(PrixM2)=c("Arrondissement","M2_Appart","M2_Maison","M2_Loyer")
+# Supression du symbol euro
+PrixM2$M2_Appart=gsub('\u20AC','',PrixM2$M2_Appart)
+# Suppression des espaces
+PrixM2$M2_Appart=as.numeric(gsub("\\D",'',PrixM2$M2_Appart))
+# Application sur les loyers (on ne cons=erve pas les maisons car elles sont rares sur Paris)
+PrixM2$M2_Maison=NULL
+PrixM2$M2_Loyer=gsub('\u20AC','',PrixM2$M2_Loyer)
+PrixM2$M2_Loyer=as.numeric(gsub("\\D",'',PrixM2$M2_Loyer))
+# On ajoute les données liées au M2 à la base AirBnb
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux5Monuments.rds'))
+Normaux$M2_Appart=Normaux$M2_Loyer=0
+Normaux$M2_Appart=PrixM2$M2_Appart[match(Normaux$arrondissement,PrixM2$Arrondissement)]
+Normaux$M2_Loyer=PrixM2$M2_Loyer[match(Normaux$arrondissement,PrixM2$Arrondissement)]
+
+# ON sauvergarde les deux bases modifiées pour ne pas à avoir à resourcer cette étape par la suite.
+saveRDS(PrixM2,file=paste0(getwd(),'\\Data\\PrixM2.RDS')) 
+saveRDS(Normaux,file=paste0(getwd(),'\\Data\\Normaux5M2.RDS')) 
+```
+
+```{r results ='asis',tidy=TRUE, eval=TRUE}
+PrixM2=readRDS(file=paste0(getwd(),'\\Data\\PrixM2.RDS'))
+
+G1=gvisBarChart(PrixM2, xvar="Arrondissement",yvar="M2_Loyer",
+options=list(width=500, height=500,
+title='Prix M2 location par arrondissement'))
+
+G2=gvisBarChart(PrixM2, xvar="Arrondissement",yvar="M2_Appart",
+options=list(width=500, height=500,
+title='Prix M2 achat par arrondissement'))
+plot(gvisMerge(G1 ,G2, horizontal=TRUE))
+```
+
+## Base SIRENE : restaurants
+
+**Un enrichissement est effectué en ajoutant la distance entre chaque bien Airbnb et le restaurant le plus proche.**
+
+La géolocalisation des restaurants est effectuée grâce à la base SIRENE (en date de janvier 2017) et l'application de géolocalisation *photon*. Il s'agit d'un géocodeur s'appuyant sur les données d'OpenStreetMap et basé sur un moteur de recherche Elasticsearch et la structure de données de Nominatim : https://github.com/komoot/photon. Contrairement à openstreetmap, la limitation du nombre de requètes pouvant être effectué est beaucoup moins contraignante : quand openstreetmap rejette des demandes à partir de la 500^ème^ demande, les plus de 22 000 restaurants sont géocodés en environ 2h.
+
+### Chargement du fichier
+
+**Compte tenu de la taille du fichier SIRENE (plus de 8Go), le chargement se fait partiellement et en plusieurs étapes. Dans un premier temps, seules les 10 premières lignes sont chargées afin de pouvoir identifier les colonnes qui nous intéressent.**
+```{r Restaurant_Ajout_1,eval=TRUE}
+#SIRENE=read.csv(paste0(getwd(),'\\Data\\','sirc-17804_9075_14209_201612_L_M_20170104_171522721.csv'),sep=';',header = TRUE,nrows = 10) # On ne lance pas cette ligne car la base SIRENE fait 8Go et on ne souhaite pas la conserver en permanence sur l'ordinateur. 
+#On utilisera à la place une version légère pour faire afficher les noms. On aurait pu conserver une version zippé du dossier et l'ouvrir directement sous R.
+SIRENE=readRDS(file=paste0(getwd(),'\\Data\\SIRENE_small.rds'))
+names(SIRENE)
+```
+**Les champs qui nous intéressent sont :**
+  
+  Champs        | Objet   
+--------------|-------------
+LIBCOM        | Lieu
+LIBAPET       | Secteur d'activité
+L4_NORMALISEE | Adresse
+CODPOS        | Code postal
+
+**On extrait donc ces 4 champs en filtrant les lieux situés sur Paris. Pour ce faire, on utilise la fonction *fread()* du package data.table. Ceci permet de charger les élèments qui nous interessent en moins d'une minute contre un bon quart d'heure en utilisant read.csv : sur les  10 millions de lignes du fichier SIRENE, 844 010 sont extraites.**
+```{r Restaurant_Ajout_2,eval=FALSE,}
+#Afin d'accélérer le chargement on utilise la fonction fread du package data.table, on ne récupère que les 4 colonnes nécessaires et on filtre sur Paris.
+SIRENE_Paris=fread(paste0(getwd(),'\\Data\\','sirc-17804_9075_14209_201612_L_M_20170104_171522721.csv'),sep=';',header = TRUE)[grep('PARIS.[0-9]+',LIBCOM),c('LIBCOM','LIBAPET','L4_NORMALISEE','CODPOS')]
+saveRDS(SIRENE_Paris,file=paste0(getwd(),'\\Data\\','SIRENE_Paris.rds'))
+```
+**Une fois l'extrait de la base SIRENE Paris récupéré, une première analyse est effectuée au niveau des secteurs d'activités envisageables.**
+```{r Restaurant_Ajout_3,eval=TRUE}
+SIRENE_Paris=readRDS(file=paste0(getwd(),'\\Data\\','SIRENE_Paris.rds'))
+SIRENE_Paris_Secteur=unique(SIRENE_Paris$LIBAPET)
+length(SIRENE_Paris_Secteur)
+```
+**Il y a 692 secteurs d'activité sur Paris. Pour les besoins de l'étude, on décide d'extraire les secteurs liés à la restauration. Pour ce faire, on extrait l'ensemble des lignes dont le secteur d'activité est 'Restaurant + n'importe quoi'. Cela conduit à 3 secteurs d'activité.**
+**De plus, on agrège les codes postaux 75116 et 75016.**
+```{r Restaurant_Ajout_4,eval=TRUE}
+# Récupération des compagnies de restauration
+SIRENE_PARIS_Cible=SIRENE_Paris_Secteur[grep('Restauration.+',SIRENE_Paris_Secteur)]
+
+SIRENE_Paris_Restaurant=subset(SIRENE_Paris,SIRENE_Paris$LIBAPET %in% SIRENE_PARIS_Cible)
+SIRENE_Paris_Restaurant$CODPOS[SIRENE_Paris_Restaurant$CODPOS=='75116']='75016'
+temp=SIRENE_Paris_Restaurant %>% group_by(LIBAPET) %>% summarise(Nb=length(LIBAPET))
+kable(temp)
+```
+
+**Une rapide recherche sur internet indique que Paris comptait 13 822 restaurants en 2014. (https://fr.statista.com/statistiques/516685/nombre-restaurants-par-categorie-paris/). Aussi l'étude pourrait se focaliser sur la restauration traditionnelle uniquement (ou distinguer ces trois types de restauration). On concerve cependant les restaurants de type rapide et restaurants traditionnelles dans la suite de l'étude.**
+
+```{r Restaurant_Ajout_5,eval=FALSE}
+temp= SIRENE_Paris_Restaurant %>% group_by(CODPOS) %>% summarise(Nb=length(CODPOS))
+
+temp$CODPOS=factor(temp$CODPOS, levels = temp$CODPOS[order(temp$Nb,decreasing=TRUE)])
+
+p=ggplot(data=temp, aes(x=CODPOS,y=Nb)) +
+geom_bar(position="dodge",stat="identity") + 
+coord_flip() +
+ggtitle(paste0('Nombre de restaurant par arrondissements'))
+
+p
+
+SIRENE_Paris_Restaurant=subset(SIRENE_Paris_Restaurant,SIRENE_Paris_Restaurant$LIBAPET %in% c('Restauration traditionnelle','Restauration de type rapide'))
+saveRDS(SIRENE_Paris_Restaurant,paste0(getwd(),'\\Data\\SIRENE_Paris_Restaurant.rds'))
+```
+
+### Géocodage
+
+**On géocode les différents restaurants de la base SIRENE avec le package Photon :**
+
+```{r Restaurant_Ajout_6,eval=FALSE}
+# Geocodage de la base 
+SIRENE_Paris_Restaurant=readRDS(paste0(getwd(),'\\Data\\SIRENE_Paris_Restaurant.rds'))
+# On utlise le package photon pour géocoder les différents restaurant parisien
+devtools::install_github(repo = 'rCarto/photon')
+library(photon)
+# le géocodage est effectué avec l'adresse (L4_Normalisee), le codpostale et par sécurité Paris France.
+locgeo <- geocode(paste(SIRENE_Paris_Restaurant$L4_NORMALISEE,SIRENE_Paris_Restaurant$CODPOS,'Paris','France',sep=","), limit = 1, key = "place")
+saveRDS(locgeo,'locgeo.rds')
+
+locgeo=readRDS('locgeo.rds')
+SIRENE_Paris_Restaurant$lat=locgeo$lat
+SIRENE_Paris_Restaurant$lon=locgeo$lon
+
+# Suppression des points hors Paris ou non trouvé
+locgeo_propre=subset(locgeo,!is.na(locgeo$lat) |(locgeo$lat<1.5 & locgeo$lon<43.7))
+SIRENE_Paris_Restaurant=subset(SIRENE_Paris_Restaurant,!is.na(SIRENE_Paris_Restaurant$lat) |(SIRENE_Paris_Restaurant$lat<1.5 & SIRENE_Paris_Restaurant$lon<43.7))
+saveRDS(SIRENE_Paris_Restaurant,paste0(getwd(),'\\Data\\SIRENE_Paris_Restaurant.rds'))
+# Récupération de la carte de Paris
+map<-get_map(location = "Paris", zoom=12, maptype="roadmap",color = "bw")
+saveRDS(map,paste0(getwd(),'\\Data\\map.rds'))
+```
+
+### Visualisation
+
+**On trace ensuite la densité de présence des différents restaurants :**
+
+```{r Restaurant_Ajout_7,eval=TRUE,warning=FALSE,message=FALSE}
+SIRENE_Paris_Restaurant=readRDS(paste0(getwd(),'\\Data\\SIRENE_Paris_Restaurant.rds'))
+map=readRDS(paste0(getwd(),'\\Data\\map.rds'))
+
+# Géolocalisation des restaurant traditionnelles
+
+overlay<-stat_density2d(data=subset(SIRENE_Paris_Restaurant,SIRENE_Paris_Restaurant$LIBAPET=="Restauration traditionnelle"), aes(x=lon, y=lat, fill=..level.., alpha=..level..), contour=T, n=100, geom="polygon")
+densi<- ggmap(map) + overlay +scale_fill_gradient("Traditionnelles") +scale_alpha(range=c(0.4,0.75),guide=FALSE) + guides(fill=guide_colorbar(barwidth=1.5, barheight = 10))
+densi
+
+# Géolocalisation des restaurants rapide
+
+overlay<-stat_density2d(data=subset(SIRENE_Paris_Restaurant,SIRENE_Paris_Restaurant$LIBAPET=="Restauration de type rapide"), aes(x=lon, y=lat, fill=..level.., alpha=..level..), contour=T, n=100, geom="polygon")
+densi<- ggmap(map) + overlay +scale_fill_gradient("Rapide") +scale_alpha(range=c(0.4,0.75),guide=FALSE) + guides(fill=guide_colorbar(barwidth=1.5, barheight = 10))
+densi
+
+```
+
+**Les deux types de restaurants sont environ situés au même endroit.**
+
+### Ajout de la distance au restaurant le plus proche
+
+**La distance minimale est calculée en utilisant la grille pour accélérer les calculs (on ne retient qu'une seule case quand on devrait en retenir 9...)**
+
+
+```{r Restaurant_Ajout_8,eval=FALSE}
+# Le code est similaire à celui du calcul des distances au métro.
+locgeo=readRDS(file=paste0(getwd(),'\\Data\\locgeo.rds'))
+locgeo=subset(locgeo,!is.na(locgeo$lat))
+locgeo$Grille = Position_Grille(lat=locgeo$lat,long=locgeo$lon,Taille)
+
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux5Monuments.rds'))
+
+log=NULL
+for (i in 1:nrow(Normaux)) {
+print(i/nrow(donnees))
+temp=subset(locgeo,Metro_Grille(locgeo$Grille,Normaux$Grille,i))
+if (nrow(temp)==0) {
+print(paste0('pas de correspondance pour la',i,'eme donnee'))
+log=c(log,i)
+Normaux$Restaurant[i]=0
+next
+}
+else Normaux$Restaurant[i]=dist(lat=Normaux$latitude[i],long=Normaux$longitude[i],table_lat=temp$lat,table_long=temp$lon)
+}
+
+print(paste0('Pourcentage de la base traité :',(1-length(log)/nrow(donnees))*100,'%'))
+saveRDS(Normaux,paste0(getwd(),'\\Data\\Normaux6Restaurant.rds'))
+```
+
+# Modèle prédictif
+
+**Les étapes suivantes sont réalisées : **
+
+  - **découpage de la base en base d'apprentissage et en base de test.**
+  
+  - **Entrainement de plusieurs algorithmes prédictifs.**
+  
+  - **Sélection du meilleur au sens d'une métrique de performance (ici la MAPE).**
+  
+  - **Récupération des variables d'importance du meilleur algorithme.**
+
+**Compte tenu des résultats observés in fine, cette étape mériterait d'être approfondie. Cependant, l'objet premier du notebook étant la visualisation de la base airbnb ce point n'a pas été creusé d'avantage.**
+
+## Sans enrichissement
+
+### Toutes les variables
+
+```{r Modele0, eval=FALSE}
+# Le code étant long les résultats sont stockés pour ne pas avoir à retourner à chaque fois.
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux6Restaurant.rds'))
+Normaux=subset(Normaux,Normaux$price!=0)
+
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+# On ne conserve que les variables intiales (ou issues d'un retraitement des variables initiales)
+Train=Normaux[N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude')]
+# Arbre complet
+Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+temp=summary(Arbre,digits=3)
+# Elagage
+CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+Arbre_0=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+
+saveRDS(Arbre_0,paste0(getwd(),'\\Data\\Arbre_0.rds'))
+```
+
+**En se basant uniquement sur les données initiales, un arbre CART elagué conduit à un erreur absolue moyenne en pourcentage de 32% (avec un découpage train-test de 70%-30%), avec les variables d'importance suivante : **
+
+```{r results ='asis',tidy=TRUE, eval=TRUE}
+# On recharge la base prétraitée.
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux6Restaurant.rds'))
+Normaux=subset(Normaux,Normaux$price!=0)
+# On charge l'arbre élagué numéro 1
+Arbre_0=readRDS(paste0(getwd(),'\\Data\\Arbre_0.rds'))
+# Grace à la graine on recalcule la base test utilisé pour la constructoin du premier arbre.
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+Test=Normaux[-N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude')]
+
+Var_imp0 <- gvisTable(data.frame('Variable'=row.names(varImp(Arbre_0)),varImp(Arbre_0)), options = list(page = "enable",header='V'))
+plot(Var_imp0 )
+# Variables d'importance de l'arbre.
+Pred=cbind('Modele'=predict(Arbre_0,newdata = Test),'Cible'=Test$price)
+paste0('MAPE : ',MAPE(Pred[,1],Pred[,2]))
+```
+
+**Le graphique qqplot des prix predits versus prix réels indique cependant qu'en regroupant les prix par quantile de 0.2% le modèle intial fournit déjà des tendances raisonnables (s'il ne peut prédire précisément le prix il permet de définir assez proprement l'ordre de grandeur).**
+
+**Il est également à noter que la MAPE (erreur absolue moyenne en pourcentage) est une mesure plus restrictive que la MAE dans le sens ou un faible écart sur des prix peu élevés peu conduire à une MAPE importante (elle incite donc le modèle à s'occuper de toutes les gammes de prix).**
+
+```{r results ='asis',tidy=TRUE, eval=TRUE}
+evaluate_calibration(Pred[,1],Pred[,2],q=500)
+```
+
+**Les résultats sans enrichissement font apparaitre trois grands types de variables importantes :** 
+
+  - **Des variables de géolocalisation : l'arrondissement,la latitude et la longitude**
+  
+  - **Des varibales de description du bien : le nombre de personnes pouvant loger (accommodates) et le nombre de salle de bain.**
+  
+  - **le nombre de nuits à louer au minimum.**
+  
+**Cela peut se résumer ainsi : les variables de géolocalisation arrivent en tête car elles permettent de cibler si le bien est proche des lieux intéressants, le deuxième lot de variables correspond à la capacité d'accueil, puis enfin une variable de contrainte (nombre de nuits à louer au minimum). Les caractéristiques du bien (type de lit, type de bien et le caractère privatif ne semble pas avoir d'impact.**
+
+**Afin de mesurer l'impact des variables de géolocalisation, on ajuste un arbre en ne retenant que la latitud puis inversement en retenant toutes les variables sauf celles de géolocalisation (code non repris car redondant) :**
+
+  - **la longitude et l'arrondissement.La MAPE passe alors de 32% à 48%.**
+  
+  - **le fait d'enlever les variables de géolocalisation fait passer la MAPE de 32% à 36%.**
+
+**Ces résultats laissent à penser que les résultats obtenus sur le premier arbre sont trompeurs (en termes d'importance des variables) et sont dus à l'instabilité de la méthode CART.**
+
+### Stabilité 
+
+**On vérifie la stabilité des variables d'importances en construisant 20 échantillons aléatoires sans remises et en relançant l'ajustement sur chaque jeu de données.**
+
+```{r Modele0_Stab, eval=FALSE}
+Normaux=subset(Normaux,Normaux$price!=0)
+
+Var_Import0=data.frame('Var'=c('room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude'))
+
+set.seed(8)
+Modele_FULL0=list()
+for (i in 1:20){
+  print(i)
+  N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+  Train=Normaux[N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude')]
+  Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+  temp=summary(Arbre,digits=3)
+  CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+  Arbre=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+  Modele_FULL0[[i]]=Arbre
+  Var_Import0=cbind.data.frame(Var_Import0,varImp(Arbre)[1:(length(names(Train))-1),1])
+}
+saveRDS(Modele_FULL0,paste0(getwd(),'\\Data\\Modele_FULL0.rds'))
+saveRDS(Var_Import0,file=paste0(getwd(),'\\Data\\Var_Import0.RDS'))
+
+Modele_FULL0=readRDS(paste0(getwd(),'\\Data\\Modele_FULL0.rds'))
+Var_Import0=readRDS(file=paste0(getwd(),'\\Data\\Var_Import0.RDS'))
+
+set.seed(8)
+Pred_FULL0=MAPE_FULL0=list()
+for (i in 1:20){
+  N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+  Test=Normaux[-N,-grep('id|Cher|Grille|minimum_nights|property_type',names(Normaux))]
+  Pred_FULL0[[i]]=cbind(predict(Modele_FULL0[[i]],newdata = Test),Test$price)
+  MAPE_FULL0[[i]]=MAPE(Pred_FULL0[[i]][,1],Pred_FULL0[[i]][,2])
+}
+
+saveRDS(MAPE_FULL0,file=paste0(getwd(),'\\Data\\MAPE_FULL0.RDS'))
+
+```
+```{r Modele0_Stab2, eval=TRUE,warning=FALSE,message=FALSE}
+Var_Import0=readRDS(file=paste0(getwd(),'\\Data\\Var_Import0.RDS'))
+MAPE_FULL0=readRDS(file=paste0(getwd(),'\\Data\\MAPE_FULL0.RDS'))
+
+print("Distribution de la MAPE :")
+summary(unlist(MAPE_FULL0))
+
+Var_Import0=as.data.frame(Var_Import0)
+
+temp=data.frame('Var'=factor(Var_Import0$Var),'Mean'=apply(Var_Import0[,-1],1,mean))
+
+temp$Var=factor(temp$Var, levels = temp$Var[order(temp$Mean,decreasing=TRUE)])
+
+p=ggplot(temp, aes(x=Var,y=Mean)) + geom_bar(position="dodge",stat="identity") + coord_flip()+theme(axis.text.x = element_text(face="bold", color="#993333", size=6, angle=45))
+ggplotly(p)
+
+```
+
+**In fine, les variables liées à la description du bien l'emportent très largement sur les variables de localisation. De plus l'aléa ajouté dans la méthode améliore le modèle. On pourrait alors se baser sur un modèle prédisant la moyenne de plusieurs arbres CART (type random forest) afin d'améliorer les résultats.**
+
+## Avec enrichissement
+
+**L'analyse de l'impact de l'enrichissement est effectuée en ajoutant les différentes variables au fur et à mesure.**
+  
+```{r Modele1, eval=FALSE}
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux6Restaurant.rds'))
+Normaux=subset(Normaux,Normaux$price!=0)
+
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+# Ajout prix M2
+Train=Normaux[N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','M2_Loyer','M2_Appart')]
+Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+temp=summary(Arbre,digits=3)
+CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+Arbre_M2=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+saveRDS(Arbre_M2,paste0(getwd(),'\\Data\\Arbre_M2.rds'))
+
+# Ajout distance au Metro
+Train=Normaux[N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','Metro')]
+Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+temp=summary(Arbre,digits=3)
+CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+Arbre_METRO=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+saveRDS(Arbre_METRO,paste0(getwd(),'\\Data\\Arbre_METRO.rds'))
+
+# Ajout distance au restaurant
+Train=Normaux[N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','Metro','Restaurant')]
+Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+temp=summary(Arbre,digits=3)
+CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+Arbre_Restaurant=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+saveRDS(Arbre_Restaurant,paste0(getwd(),'\\Data\\Arbre_Restaurant.rds'))
+
+# Ajout des distances aux monuments
+
+Train=Normaux[N,-grep('id|Cher|Grille|minimum_nights|property_type|M2_Loyer|M2_Appart',names(Normaux))]
+Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+temp=summary(Arbre,digits=3)
+CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+Arbre_Monuments=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+saveRDS(Arbre_Monuments,paste0(getwd(),'\\Data\\Arbre_Monuments.rds'))
+
+```
+### Impact du prix du M2
+
+**Les variables liées au prix du M2 sont considérées comme importantes par le modèle. Elles n'améliorent pas la qualité de prédiction et doivent surement être trop redondantes avec l'arrondissement (on aurait pu imaginer que ces deux variables permettraient de regrouper des arrondissements présentants des prix similaires). On les retire dans la suite de l'étude.**
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+Arbre=readRDS(paste0(getwd(),'\\Data\\Arbre_M2.rds'))
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+Test=Normaux[-N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','M2_Loyer','M2_Appart')]
+Var_imp0 <- gvisTable(data.frame('Variable'=row.names(varImp(Arbre)),varImp(Arbre)), options = list(page = "enable",header='V'))
+plot(Var_imp0 )
+
+Pred_M2=cbind('Modele'=predict(Arbre,newdata = Test),'Cible'=Test$price,"Modele_Initial"=Pred[,1])
+
+paste0('MAE : ',paste0(MAPE(Pred_M2[,1],Pred_M2[,2])))
+```
+
+### Impact de la distance au métro
+
+**La variable mesurant la distance au métro est considérée comme importante par le modèle. Elle n'améliore cependant pas sa capacité de prédiction. Comme elle ne dégrade pas fortement le modèle elle est conservée par la suite.**
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+Arbre=readRDS(paste0(getwd(),'\\Data\\Arbre_METRO.rds'))
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+Test=Normaux[-N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','Metro')]
+Var_imp0 <- gvisTable(data.frame('Variable'=row.names(varImp(Arbre)),varImp(Arbre)), options = list(page = "enable",header='V'))
+plot(Var_imp0 )
+Pred_Metro=cbind('Modele'=predict(Arbre,newdata = Test),'Cible'=Test$price,"Modele_Initial"=Pred[,1])
+paste0('MAE : ',paste0('MAE : ',MAPE(Pred_Metro[,1],Pred_Metro[,2])))
+```
+
+### Impact de la distance à un restaurant
+
+**La variable mesurant la distance à un restaurant est considérée comme importante par le modèle. Elle n'améliore cependant pas sa capacité de prédiction. Comme elle ne dégrade pas fortement le modèle elle est conservée par la suite.**
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+Arbre=readRDS(paste0(getwd(),'\\Data\\Arbre_Restaurant.rds'))
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+Test=Normaux[-N,c('price','room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude','Metro','Restaurant')]
+print("Variables d'importance :")
+Var_imp0 <- gvisTable(data.frame('Variable'=row.names(varImp(Arbre)),varImp(Arbre)), options = list(page = "enable",header='V'))
+plot(Var_imp0 )
+Pred_Restaurant=cbind('Modele'=predict(Arbre,newdata = Test),'Cible'=Test$price,"Modele_Initial"=Pred[,1])
+
+
+paste0('MAPE : ',MAPE(Pred_Restaurant[,1],Pred_Restaurant[,2]))
+```
+
+### Impact de la distance à un monument
+
+**Les variables mesurant la distance à divers monuments parisiens sont considérées comme importantes par le modèle et permettent d'améliorer sensiblement sa capacité de prédiction.**
+
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+Arbre=readRDS(paste0(getwd(),'\\Data\\Arbre_Monuments.rds'))
+set.seed(8)
+N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+Test=Normaux[-N,-grep('id|Cher|Grille|minimum_nights|property_type|M2_Loyer|M2_Appart',names(Normaux))]
+Var_imp0 <- gvisTable(data.frame('Variable'=row.names(varImp(Arbre)),varImp(Arbre)), options = list(page = "enable",header='V'))
+plot(Var_imp0 )
+Pred_Monuments=cbind('Modele'=predict(Arbre,newdata = Test),'Cible'=Test$price,"Modele_Initial"=Pred[,1])
+
+paste0('MAPE : ',MAPE(Pred_Monuments[,1],Pred_Monuments[,2]))
+```
+
+### Stabilité
+**On vérifie la stabilité des variables d'importances en construisant cent échantillons aléatoires sans remise et en relançant l'ajustement sur chaque jeu de données.**
+
+```{r Modele1_Stab, eval=FALSE}
+Normaux=subset(Normaux,Normaux$price!=0)
+
+Var_Import=data.frame('Var'=names(Normaux[,-grep('price|id|Cher|Grille|minimum_nights|property_type',names(Normaux))]))
+
+set.seed(8)
+Modele_FULL=list()
+for (i in 1:100){
+  print(i)
+  N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+  Train=Normaux[N,-grep('id|Cher|Grille|minimum_nights|property_type|bedrooms',names(Normaux))]
+  Arbre=rpart(price~.,data=Train,control=rpart.control(cp=0,minsplit=50,list="gini"),method="anova")
+  temp=summary(Arbre,digits=3)
+  CP_cible=temp$cptable[match(min(temp$cptable[,'xerror']),temp$cptable[,'xerror']),'CP']
+  Arbre=rpart(price~.,data=Train,control=rpart.control(cp=CP_cible,minsplit=50,list="gini"),method="anova")
+  Modele_FULL[[i]]=Arbre
+  Var_Import=cbind.data.frame(Var_Import,varImp(Arbre)[1:(length(names(Train))-1),1])
+}
+saveRDS(Modele_FULL,paste0(getwd(),'\\Data\\Modele_FULL.rds'))
+saveRDS(Var_Import,file=paste0(getwd(),'\\Data\\Var_Import.RDS'))
+
+Modele_FULL=readRDS(paste0(getwd(),'\\Data\\Modele_FULL.rds'))
+Var_Import=readRDS(file=paste0(getwd(),'\\Data\\Var_Import.RDS'))
+
+set.seed(8)
+Pred_FULL=MAE_FULL=list()
+for (i in 1:100){
+  N=sample(1:nrow(Normaux),size = 0.7*nrow(Normaux))
+  Test=Normaux[-N,-grep('id|Cher|Grille|minimum_nights|property_type',names(Normaux))]
+  Pred_FULL[[i]]=cbind(predict(Modele_FULL[[i]],newdata = Test),Test$price)
+  MAE_FULL[[i]]=MAE(Pred_FULL[[i]][,1],Pred_FULL[[i]][,2])
+}
+summary(unlist(MAE_FULL))
+
+```
+
+```{r results='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+Var_Import=readRDS(file=paste0(getwd(),'\\Data\\Var_Import.RDS'))
+Var_Import=as.data.frame(Var_Import)
+
+temp=data.frame('Var'=factor(Var_Import$Var),'Mean'=apply(Var_Import[,-1],1,mean))
+
+temp$Var=factor(temp$Var, levels = temp$Var[order(temp$Mean,decreasing=TRUE)])
+
+
+temp=temp[order(temp$Mean,decreasing = TRUE),]
+G_Var_Importance <- gvisBarChart(temp,
+xvar='Var',
+yvar='Mean',
+options=list(width=1000, height=1000,
+title="variables d'importance issues de 100 arbres"))
+plot(G_Var_Importance)
+
+```
+**Le graphique moyennisé des variables d'importance conforte l'étude précédente : **
+
+  - **2 variables descriptives sont importantes : **
+  
+    - **Caractère privatif (room type)**
+    
+    - **Nombre de personnes (accommodates)**
+
+  - **Une variable de localisation globale : la latitude (permet de savoir si l'on se trouve dans le bandeau cher correspondant au coeur de Paris)**
+  
+  - **Proximité aux monuments relatifs au zones de prix élevés (tour eiffel, louvre, trocadero, sacré coeur,...)**
+  
+  - **Les restaurants n'ont pas d'impact (les bars seraient plus interessants mais plus délicats à trouver sous la base SIRENE)**
+  
+  - **La distance au métro importe peu (la distance aux monuments étant plus important ou redondant)**
+  
+## XGBOOST
+
+**On vérifie dans cette partie si l'utlisation d'un technique de *boosting* permettrait d'améliorer la prédiction. On utilise pour cela l'algorithme xgboost**
+
+### Fonctions génériques
+
+**En amont du calibrage de différents modèles XXBOOST, certaines fonctions génériques doivent être codée. Ces dernières permettent par exemple de mettre en place les matrices parses qui alimenteront le code XGBOOST ou bien de comparer la performance de différents modèles.**
+
+```{r Modele3, eval=TRUE,warning=FALSE,message=FALSE}
+
+# Fonction pour créer les matrices alimentant le xgb. Ici on inclue les variables cibles (par la suite on excluera les varibales non cible Create.DMatrix)
+Create.DMatrix2 = function(dt) {
+  options(na.action = 'na.pass')
+  x <-sparse.model.matrix( ~ . - 1, data = dt[, grep(include, names(dt))])
+  options(na.action = 'na.omit')
+  y <- dt$price
+  return(xgb.DMatrix(data = x,label = y,missing = NA))
+}
+
+# Même donction que la précédente, à l'exception du fait que l'on indique les variables à exclure et non pas les variables à inclure.
+Create.DMatrix = function(dt) {
+  options(na.action = 'na.pass')
+  x <-sparse.model.matrix( ~ . - 1, data = dt[, -grep(exclude, names(dt))])
+  options(na.action = 'na.omit')
+  y <- dt$price
+  return(xgb.DMatrix(data = x,label = y,missing = NA))
+}
+
+# Recodage de la fonction MAE comme metrique d'arret (mais pas d'estimation) du modèle XGBOOST.
+evalerror=function(preds,dtrain){
+  labels= getinfo(dtrain,"label")
+  err=as.numeric(sum(abs(preds-labels))/length(labels))
+  return(list(metric="MAE",value=err))
+}
+
+#Permet de calculer la MAE de plusieurs modèles qui ont été préalablement entrainés.
+Best_Model = function(model, d_test, reel) {
+  nb=length(model)
+  R = data.frame(
+    'i' = rep(0, nb),
+    'MAE' = rep(0, nb),
+    'n' = rep(0, nb)
+  )
+  Compteur = 0
+  Cible = MAE(rep(0, length(reel)), reel) * length(reel)
+  for (boucle in  1:nb) {
+    Compteur = Compteur + 1
+    print(Compteur)
+    R$i[Compteur] = Compteur
+    pred <-
+      cbind(predict(model[[Compteur]], d_test),
+            reel,
+            ntreelimit = model[[Compteur]]$best_iteration)
+    R$MAE[Compteur] = MAE(pred[, 1], pred[, 2]) * length(pred[, 2]) /Cible
+    R$n[Compteur] = model[[Compteur]]$best_iteration
+  }
+  return(R)
+}
+
+```
+
+### Sans enrichissement
+
+**Partant de la base initiale, on calibre plusieurs jeux de modèles XGBOOST puis on conserve celui présentant la plus faible MAPE. L'entrainement est effectué avec une base Train et un base Test (une sélection de modèle basé sur de la validation croisée sera également possible)**
+
+```{r Modele3_0, eval=FALSE,warning=FALSE,message=FALSE}
+# On récupère la base après prétraitement (déjà chargé mais cela permettait de relancer le code pour chaque bout de paramétrage de modèle uniquement)
+Normaux=readRDS(paste0(getwd(),'\\Data\\Normaux6Restaurant.rds'))
+Normaux=subset(Normaux,Normaux$price!=0)
+
+# Fonction pour créer les matrices alimentant le xgb. Ici on inclue les variables cibles (par la suite on excluera les varibales non cible Create.DMatrix)
+Create.DMatrix2 = function(dt) {
+  # retains the missing values
+  options(na.action = 'na.pass')
+  x <-
+    sparse.model.matrix( ~ . - 1, data = dt[, grep(include, names(dt))])
+  options(na.action = 'na.omit')
+  # response
+  y <- dt$price
+  return(xgb.DMatrix(
+    data = x,
+    label = y,
+    missing = NA
+  ))
+}
+
+evalerror=function(preds,dtrain){
+  labels= getinfo(dtrain,"label")
+  err=as.numeric(sum(abs(preds-labels))/length(labels))
+  return(list(metric="MAE",value=err))
+}
+
+# Split de la base initiale
+data <- subset(Normaux,!is.na(Normaux$id))
+# Mise au formats de certains noms
+temp=names(data) ; temp=gsub(' ','_',temp); temp=gsub("'",'_',temp);names(data)=temp
+set.seed(8)
+
+N = sample(x = c(1:nrow(data)), size = 0.7 * nrow(data))
+dt_train = data[N, ]
+dt_test = data[-N, ]
+# include these columns from the model matrix
+include = paste('room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude',sep = "|")
+
+d_train = Create.DMatrix2(dt_train)
+d_test = Create.DMatrix2(dt_test)
+
+# Paramétrage du xgboost et tests de plusieurs modèles.
+params <- list(
+  gamma = 0,
+  min_child_weight = 1.5,
+  seed = 42,
+  eval_metric=evalerror,
+  nthread=8
+)  
+
+Compteur=0
+bstPpd_Init=list()
+for (eta in  c(0.01)){
+  for (reg_alpha in seq(0.5, 1, by = 0.5)) {
+    for (reg_lambda in seq(0.5, 1, by = 0.3)) {
+      for (max_depth in seq(2, 6, by = 2)) {
+        for (subsample in seq(0.6, 1, by = 0.2)) {
+          Compteur = Compteur + 1
+          print(Compteur)
+          bstPpd_Init[[Compteur]] <- xgboost::xgb.train(data = d_train,
+                                                   nrounds = 10000,
+                                                   params = params,
+                                                   reg_alpha=reg_alpha,
+                                                   reg_lambda=reg_lambda,
+                                                   eta=eta,
+                                                   max_depth=max_depth,
+                                                   subsample=subsample,
+                                                   watchlist=list(train=d_train, test=d_test),
+                                                   objective='reg:gamma',
+                                                   base_score=mean(dt_train$price),early_stopping_round = 50,
+                                                   maximize=FALSE
+          )
+        }
+      }
+    }
+  }
+}
+
+saveRDS(object = bstPpd_Init,file = paste0(getwd(),'\\Data\\bstPpd_Init.rds'))
+
+# On séléctionne le meilleur modèle en temre de MAE.
+Eval_model_Init=Best_Model_court(model=bstPpd_Init,d_test=d_test,reel = dt_test$price)
+best_Init=Eval_model_Init[match(min(Eval_model_Init$MAE),Eval_model_Init$MAE),]
+
+# Calcul des variables d'importance sur le meilleur modèle
+importance_Init <- xgb.importance( feature_names =c('room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude'),model = bstPpd_Init[[best_Init$i]])
+
+saveRDS(object = best_Init,file = paste0(getwd(),'\\Data\\best_Init.rds'))
+saveRDS(object = importance_Init,file = paste0(getwd(),'\\Data\\importance_Init.rds'))
+```
+
+```{r results='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+# On récupère les résultats du xboost que l'on a précdemment fait tourner
+bstPpd_Init=readRDS(file = paste0(getwd(),'\\Data\\bstPpd_Init.rds'))
+best_Init=readRDS(file = paste0(getwd(),'\\Data\\best_Init.rds'))
+importance_Init=readRDS(file = paste0(getwd(),'\\Data\\importance_Init.rds'))
+# Pour plus de lisibilité on n'utilise pas la fonction : xgb.plot.importance(importance_matrix = importance)
+G_Var_Importance <- gvisBarChart(importance_Init,
+xvar='Feature',
+yvar='Gain',
+options=list(width=1000, height=1000,
+title="variables d'importance issues du XGBOOST sans enrichissement"))
+plot(G_Var_Importance)
+```
+
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+# Recaclul de l'échantillon de test (grâce à la graine)
+data <- subset(Normaux,!is.na(Normaux$id))
+# Mise au formats de certains noms
+temp=names(data) ; temp=gsub(' ','_',temp); temp=gsub("'",'_',temp);names(data)=temp
+set.seed(8)
+N = sample(x = c(1:nrow(data)), size = 0.7 * nrow(data))
+# exclude these columns from the model matrix
+include = paste('room_type.y','accommodates','bathrooms','Lit','arrondissement','Type','Nuit','latitude','longitude',sep = "|")
+d_test = Create.DMatrix2(data[-N, ])
+
+
+Compare_Init=data.frame("Modele"=predict(bstPpd_Init[[best_Init$i]], d_test, ntreelimit = best_Init$n),"Cible"=data[-N, ]$price,"Modele_Initial"=Pred[,1])
+Compare_Init$Ecart=abs(Compare_Init$Modele/Compare_Init$Cible-1)
+
+print("Statistique de prédiction de prix :")
+
+Var_imp0 <- gvisTable(data.frame('Grandeur'=c('Min','1er quantile','Mediane','3eme quantile','Max'),
+                                 'Modele XGB sans enrichissement'=c(min(Compare_Init[,1]),quantile(Compare_Init[,1],0.25),quantile(Compare_Init[,1],0.5),quantile(Compare_Init[,1],0.75),max(Compare_Init[,1])),
+                                 'Modele CART'=c(min(Compare_Init[,3]),quantile(Compare_Init[,3],0.25),quantile(Compare_Init[,3],0.5),quantile(Compare_Init[,3],0.75),max(Compare_Init[,3])),
+                                 'Reel'=c(min(Compare_Init[,2]),quantile(Compare_Init[,2],0.25),quantile(Compare_Init[,2],0.5),quantile(Compare_Init[,2],0.75),max(Compare_Init[,2]))),
+                      options = list(page = "enable",header='V'))
+
+plot(Var_imp0 )
+paste0('MAPE : ',paste0(MAPE(Compare_Init[,1],Compare_Init[,2])))
+
+evaluate_calibration(Compare_Init[,1],Compare_Init[,2],q=500)
+```
+
+**D'une manière synthétique, les conclusions suivantes peuvent être indiquée :**
+
+  - **Le modèle XGBOOST fait ressortir des variables d'importances identiques (avec un ordre légèrement différent) de celles issues du modèle CART boostraté**
+  
+  - **Le modèle XGBOOST permet de mieux cibler les prix (scope de prix plus large) et fournit une meilleur MAPE.**
+  
+  - **La position du bien ne ressort pas comme une variable importante**
+  
+
+### Avec enrichissement
+
+**On relance le modèle en ajoutant cette fois les variables issues de l'enrichissement**
+
+```{r Modele4_0, eval=FALSE,warning=FALSE,message=FALSE}
+
+Create.DMatrix = function(dt) {
+  # retains the missing values
+  options(na.action = 'na.pass')
+  x <-
+    sparse.model.matrix( ~ . - 1, data = dt[, -grep(exclude, names(dt))])
+  options(na.action = 'na.omit')
+  # response
+  y <- dt$price
+  return(xgb.DMatrix(
+    data = x,
+    label = y,
+    missing = NA
+  ))
+}
+
+
+evalerror=function(preds,dtrain){
+  labels= getinfo(dtrain,"label")
+  err=as.numeric(sum(abs(preds-labels))/length(labels))
+  return(list(metric="MAE",value=err))
+}
+
+# Split de la base initiale
+data <- subset(Normaux,!is.na(Normaux$id))
+# Mise au formats de certains noms
+temp=names(data) ; temp=gsub(' ','_',temp); temp=gsub("'",'_',temp);names(data)=temp
+set.seed(8)
+
+N = sample(x = c(1:nrow(data)), size = 0.7 * nrow(data))
+dt_train = data[N, ]
+dt_test = data[-N, ]
+# exclude these columns from the model matrix
+exclude = paste('id','minimum_nights','property_type','price','Cher','Grille',sep = "|")
+d_train = Create.DMatrix(dt_train)
+d_test = Create.DMatrix(dt_test)
+
+params <- list(
+  gamma = 0,
+  min_child_weight = 1.5,
+  seed = 42,
+  eval_metric=evalerror,
+  nthread=8
+)  
+
+Compteur=0
+bstPpd=list()
+for (eta in  c(0.01,0.001)){
+  for (reg_alpha in seq(0.1, 1, by = 0.3)) {
+    for (reg_lambda in seq(0.1, 1, by = 0.3)) {
+      for (max_depth in seq(2, 6, by = 2)) {
+        for (subsample in seq(0.6, 1, by = 0.2)) {
+          Compteur = Compteur + 1
+          print(Compteur)
+          bstPpd[[Compteur]] <- xgboost::xgb.train(data = d_train,
+                                                   nrounds = 10000,
+                                                   params = params,
+                                                   reg_alpha=reg_alpha,
+                                                   reg_lambda=reg_lambda,
+                                                   eta=eta,
+                                                   max_depth=max_depth,
+                                                   subsample=subsample,
+                                                   watchlist=list(train=d_train, test=d_test),
+                                                   objective='reg:gamma',
+                                                   base_score=mean(dt_train$price),early_stopping_round = 50,
+                                                   maximize=FALSE
+          )
+        }
+      }
+    }
+  }
+}
+
+
+saveRDS(object = bstPpd,file = paste0(getwd(),'\\Data\\bstPpd.rds'))
+
+
+Eval_model=Best_Model_court(model=bstPpd,d_test=d_test,reel = dt_test$price)
+best=Eval_model[match(min(Eval_model$MAE),Eval_model$MAE),]
+importance <- xgb.importance( feature_names = names(dt_train[, -grep(exclude, names(dt_train))]),model = bstPpd[[best$i]])
+
+saveRDS(object = best,file = paste0(getwd(),'\\Data\\best.rds'))
+saveRDS(object = importance,file = paste0(getwd(),'\\Data\\importance.rds'))
+```
+
+```{r results='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+bstPpd=readRDS(file = paste0(getwd(),'\\Data\\bstPpd.rds'))
+best=readRDS(file = paste0(getwd(),'\\Data\\best.rds'))
+importance=readRDS(file = paste0(getwd(),'\\Data\\importance.rds'))
+# Pour plus de lisibilité on n'utilise pas la fonction : xgb.plot.importance(importance_matrix = importance)
+G_Var_Importance <- gvisBarChart(importance,
+xvar='Feature',
+yvar='Gain',
+options=list(width=1000, height=1000,
+title="variables d'importance issues du XGBOOST complet"))
+plot(G_Var_Importance)
+```
+
+```{r results ='asis',tidy=TRUE, eval=TRUE,warning=FALSE,message=FALSE}
+# Split de la base initiale
+data <- subset(Normaux,!is.na(Normaux$id))
+# Mise au formats de certains noms
+temp=names(data) ; temp=gsub(' ','_',temp); temp=gsub("'",'_',temp);names(data)=temp
+set.seed(8)
+
+N = sample(x = c(1:nrow(data)), size = 0.7 * nrow(data))
+# exclude these columns from the model matrix
+exclude = paste('id','minimum_nights','property_type','price','Cher','Grille',sep = "|")
+d_test = Create.DMatrix(data[-N, ])
+
+Compare=data.frame("Modele"=predict(bstPpd[[best$i]], d_test, ntreelimit = best$n),"Cible"=data[-N, ]$price,"Modele_Initial"=Pred[,1])
+Compare$Ecart=abs(Compare$Modele/Compare$Cible-1)
+
+print("Statistique de prédiction de prix :")
+
+Var_imp0 <- gvisTable(data.frame('Grandeur'=c('Min','1er quantile','Mediane','3eme quantile','Max'),
+                                 'Modele XGB sans enrichissement'=c(min(Compare_Init[,1]),quantile(Compare_Init[,1],0.25),quantile(Compare_Init[,1],0.5),quantile(Compare_Init[,1],0.75),max(Compare_Init[,1])),
+                                 'Modele XGB'=c(min(Compare[,1]),quantile(Compare[,1],0.25),quantile(Compare[,1],0.5),quantile(Compare[,1],0.75),max(Compare[,1])),
+                                 'Modele CART'=c(min(Compare[,3]),quantile(Compare[,3],0.25),quantile(Compare[,3],0.5),quantile(Compare[,3],0.75),max(Compare[,3])),
+                                 'Reel'=c(min(Compare[,2]),quantile(Compare[,2],0.25),quantile(Compare[,2],0.5),quantile(Compare[,2],0.75),max(Compare[,2]))),
+                      options = list(page = "enable",header='V'))
+
+plot(Var_imp0 )
+
+paste0('MAPE : ',paste0(MAPE(Compare[,1],Compare[,2])))
+
+evaluate_calibration(Compare[,1],Compare[,2],q=500)
+```
+
+**In fine l'enrichissement effectué permet au modèle XGBOOST de légèrement mieux prédire les prix des différents bien Airbnb. Si l'enrichissement en termes de localisation du bien introduit trop de variables corrélées il permet d'affiner le prix du bien en distinguant mieux les zones de prix élevés (à caractéristiques de biens inchangées)**
+
+# Conclusion
+
+**Sur la base de l'étude précédente, les conclusions suivantes peuvent être émises : **
+
+  - **L'approche par arbre et le xgboost indiquent que 3 types de variables impactent le prix :**
+    - **Le nombre de chambre (traduit la taille de l'appartement)**
+    - **Le charactère privatif (maison entière, chambre seule, tout partagé)**
+    - **La localisation**
+  
+  - **Le Type de bien à peu d'importance**
+
+  - **Les variables de géolocalisation sont trop nombreuses et devraient être diminuée.**
+    - **Elles se confondent lorsque l'on fait tourner plusieurs fois le modèle**
+    - **La latitude permet de cibler le coeur de Paris (qui est plus cher)**
+    - **La distance à quelques monuments parisien permet de cibler les zones à prix élevés**
+    
+  - **La présence d'un restaurant n'a pas d'impact. Il faudrait rechercher dans la base SIRENE la présence de bar (le bruit pouvant déranger)**
+  
+  - **Le modèle mériterait d'être approfondi afin d'expliquer l'évolution de l'importance de certaines variables (entre l'importance moyenne des 100 arbres et le xgboost)**
+  
+  - **L'ajout d'une information relative aux nombre de pièces ou à la taille de l'appartement permettrait de mieux cibler les prix.**
+
+  - **Le texte renseigné dans le fichier AiRbnb pourrait être traité pour le mettre en variable explicative du modèle.**
+  
+  - **Sur la base des résultats du modèle xgboost, l'enrichissement permet d'améliorer la prédiction de 3%. Ainsi dans 25% des cas, le modèle enrichi prédit le bon prix à 8,6% près contre 11,4% si l'on ne retient que les variables de la base initiale.**
+  
+# Annexe 
+
+**On présente ci-après les quelques fonctions qui ont été créées pour pouvoir faire l'étude précédente.**
+
+```{r Définition des fonctions, include=TRUE, eval=FALSE}
+# Fonction permettant de charger les packages dans le cas ou ils ne sont pas present sur le poste qui lance le progamme
+install.load.packages <- function(...){
+  liste=unlist(list(...))
+  new.pkg <- liste[!(liste %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)>0){
+    install.packages(new.pkg, dependencies = TRUE)
+  }
+  sapply(liste, require, character.only = TRUE)
+}
+
+
+# Code utilisé pour calculer la distance entre un  bien (lat,lon) et le bien plus proche d'une liste (table_lat,table_long)
+# Ce code sera utilisé pour calculer le métro et/ou restaurant le plus proche.
+# La distance est calculée par la formule geosphere (qui permet de prendre en compte la courbure de la terre pour une distance)
+dist=function(long,lat,table_long,table_lat){
+  temp=data.frame('lat'=table_lat,'lon'=table_long,'dist'=rep(0,length(table_lat)))
+  temp$dist=apply(temp,1,function(x){geosphere::distHaversine(c(long,lat),c(x[2],x[1]),r=6371000)})
+  return(min(temp$dist))
+}
+
+# Code permettant de définir dans quelle grille se trouve un point (lat,lon). 
+# Taille indique le nombre de case en largeur dans la grille (ou longueur comme c est un carre)
+# Le calcul se fait simplement par modulo
+Position_Grille = function(lat,long,Taille){
+  pas_lat = (max(Grille_lat$lat) - min(Grille_lat$lat))/Taille # nombre de latitude par case
+  pas_long = (max(Grille_long$long) - min(Grille_long$long))/Taille # nombre de longitude par case
+  i = (lat - min(Grille_lat$lat)) %/% pas_lat
+  j = (long - min(Grille_long$long)) %/% pas_long
+  return(i*Taille + j + 1)
+}
+
+# Code permettant de calculer les métros qui sont dans les 9 cases entourant un point (le fait de rentenir 9 cases permet de solutionner les problemes de bords:
+
+# |----|----|---|
+# |    |   -|   | 
+# |----|----|---|
+# |    | X  |   |
+# |----|----|---|
+# |    |    |   |
+# |----|----|---|
+
+Metro_Grille=function(Metro,Grille,i){
+  N=Grille[i]
+  liste=c(N-1,N,N+1)
+  j=max(N-30,1) # Permet de gérer la ligne du dessous (Taille de la grille = 30)
+  liste=c(liste,j-1,j,j+1)
+  j=min(N+30,899) # Permet de gérer la ligne du dessus (la taille 30*30 est ici inscrite en dur)
+  liste=c(liste,j-1,j,j+1)
+  liste=unique(liste) # Dans le cas ou l'on était en bord de carte, on a concaténé des lignes identiques.
+  return(Metro %in% liste)
+}
+
+# Code pour scraper openstreetmap : récupère la latitude et la longitude de monuments parisiens qui ont prédécemment été récupéré sur le site 'http://monumentsdeparis.net/'
+Scrap_Map=function(lieu){
+  # Construction de l'URL de recherche
+  URL <- paste("http://nominatim.openstreetmap.org/search?q=Paris+",lieu,"&polygon_geojson=1&viewbox=",sep="")
+  # Lecture du code HTML de la page
+  url.get=xml2::read_html(URL)
+  # Cette première page ne nous interesse pas réellement. Par contre en suivant l'URL du lien "details", on peut récupérer la longitude et la latitude. 
+  # Le  code suivant permant de récupérer cet URL appelé ici "code."
+  # Selection de la node ou se trouve l'information que l'on recherche (<a class="btn btn-default btn-xs details" href="details.php?place_id=179716155">details</a>)
+  HTML=url.get %>% html_nodes('a') %>% as.character()
+  # récupératoin des lignes contenant 'details.php
+  HTML=grep('details.php',HTML,value=TRUE)
+  # récupération du code pour passer à la page suivante
+  HTML=strsplit(HTML,'details')[[1]][3]
+  HTML=strsplit(HTML,'=')[[1]][2]
+  code=stringr::str_extract(HTML,'[0-9]*')
+  
+  # Lecture du code HTML de la deuxième page.
+  URL=paste0('http://nominatim.openstreetmap.org/details.php?place_id=',code)
+  url.get=xml2::read_html(URL)
+  
+  # La latitude et la longitude sont dans le code suivant : <tr><td>Centre Point</td><td>48.86114765,2.33802698859948</td></tr>
+  HTML=url.get %>% html_nodes('tr') %>% as.character()
+  HTML=grep('Centre Point',HTML,value=TRUE)
+  HTML=strsplit(HTML,'<td>')[[1]][3]
+  return(strsplit(stringr::str_extract(HTML,'[0-9]*.[0-9]*,[0-9]*.[0-9]*'),'[,]')[[1]])
+}
+
+# Fonction MAPE
+MAPE=function(preds,reel){
+  return(sum(abs(preds-reel)/reel)/length(reel))
+}
+
+# Fonction MAPE pour XGBOOST
+
+evalerror_MAPE=function(preds,dtrain){
+  labels= getinfo(dtrain,"label")
+  err=as.numeric(sum(abs(preds-labels)/labels)/length(labels))
+  return(list(metric="MAPE",value=err))
+}
+
+split_in_equal_parts <- function(x, breaks = NULL,q=20) {
+  if(is.null(breaks)) breaks <- unique(quantile(x, 0:q/q))
+  x <- cut(x, breaks, include.lowest = TRUE, right = FALSE)
+  levels(x) <- paste(breaks[-length(breaks)], ifelse(diff(breaks) > 1, c(paste("-", breaks[-c(1, length(breaks))] - 1, sep = ""), "+"), ""), sep = "")
+  return(x)
+}
+
+evaluate_calibration=function(predicted_values,actual_values,q=50){
+  
+  calibration_moy_reel=tapply(X = actual_values,INDEX = split_in_equal_parts(predicted_values,q = q),FUN = mean)
+  calibration_moy_pred= tapply(X = predicted_values,INDEX =  split_in_equal_parts(predicted_values,q = q),FUN = mean)
+  
+  t=cbind(calibration_moy_reel=tapply(X = actual_values,INDEX = split_in_equal_parts(predicted_values,q = q),FUN = mean)
+          ,
+          alibration_moy_pred= tapply(X = predicted_values,INDEX =  split_in_equal_parts(predicted_values,q = q),FUN = mean)
+          )        
+  
+  
+  R2=round(summary(lm(calibration_moy_reel ~ calibration_moy_pred))$r.squared,digits=4)
+  # return(R2)
+  res=list("calibration_moy_reel"=calibration_moy_reel,"calibration_moy_pred"=calibration_moy_pred,"predictions"=predicted_values,"R2"=R2)
+  #par(mfrow=c(2,1))
+  plot(main=paste0("QQ-PLOT (regroupement par quantile de 0.2%)",", R² = ",R2),
+       calibration_moy_pred,
+       calibration_moy_reel,            
+       type="b",col="black",lty=1,ylab="Cout moyen observation",lwd=2,xlab="Cout moyen predit"
+  )
+  abline(0,1,col="red")
+  
+  # plot(main=paste0("Ecart par tranche tarifaires",",Ecart moyen =",mean(t[,1]/t[,2])-1),
+  #      calibration_moy_pred,
+  #      t[,1]/t[,2],            
+  #      type="b",col="black",lty=1,ylab="Cout moyen observation",lwd=2,xlab="Cout moyen predit"
+  # )
+  # abline(1,0,col="red")
+}
+
+```
+  
